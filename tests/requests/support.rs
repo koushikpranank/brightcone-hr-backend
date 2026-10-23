@@ -4,7 +4,6 @@ use axum::http::{header, HeaderName, HeaderValue};
 use axum_test::{TestResponse, TestServer};
 use brightcone_hr_backend::{
     authz::Role,
-    database::Database,
     models::users::{self, NewUser},
 };
 use loco_rs::prelude::*;
@@ -12,14 +11,10 @@ use serde_json::{json, Value};
 
 pub const PASSWORD: &str = "correct horse battery staple 9";
 
-pub fn database(ctx: &AppContext) -> Database {
-    Database::from_context(ctx).expect("Diesel database is initialized")
-}
-
 /// Creates an active account directly in the database.
 pub async fn make_user(ctx: &AppContext, email: &str, role: Role) -> users::Model {
     users::Model::create_with_password(
-        &database(ctx),
+        &ctx.db,
         &NewUser {
             email: email.to_owned(),
             name: "Test Person".to_owned(),

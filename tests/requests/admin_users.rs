@@ -1,6 +1,5 @@
 use axum_test::TestServer;
 use brightcone_hr_backend::{app::App, authz::Role, models::users};
-use loco_rs::app::AppContext;
 use loco_rs::testing::prelude::*;
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -41,7 +40,7 @@ async fn hr_creates_an_account_with_a_temporary_password_that_must_be_changed() 
         assert_eq!(body["user"]["must_change_password"], true);
 
         // The password is only ever in this one response, never in the database in clear.
-        let stored = users::Model::find_by_email(&database(&ctx), "new.person@brightcone.ai")
+        let stored = users::Model::find_by_email(&ctx.db, "new.person@brightcone.ai")
             .await
             .unwrap();
         assert_ne!(stored.password, temporary);
@@ -129,7 +128,7 @@ async fn disabling_signs_the_person_out_everywhere() {
 async fn the_last_hr_admin_cannot_be_demoted_disabled_or_self_locked() {
     request::<App, _, _>(|request, ctx| async move {
         let token = hr_token(&request, &ctx).await;
-        let me = users::Model::find_by_email(&database(&ctx), "hr@brightcone.ai")
+        let me = users::Model::find_by_email(&ctx.db, "hr@brightcone.ai")
             .await
             .unwrap();
 

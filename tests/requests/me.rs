@@ -36,11 +36,7 @@ async fn me_returns_role_and_permissions_but_no_secrets() {
         assert!(permissions.contains(&json!("approvals:decide:team")));
         assert!(!permissions.contains(&json!("audit:read:all")));
         let text = response.text();
-        assert!(
-            !text.contains("\"password\"")
-                && !text.contains("api_key")
-                && !text.contains("$argon2")
-        );
+        assert!(!text.contains("password") && !text.contains("api_key"));
     })
     .await;
 }
@@ -111,7 +107,10 @@ async fn a_disabled_account_loses_access_immediately() {
         let (token, _) = sign_in(&request, "a@brightcone.ai").await;
         assert_eq!(get_as(&request, "/api/me", &token).await.status_code(), 200);
 
-        user.set_status(&database(&ctx), "disabled").await.unwrap();
+        user.into_active_model()
+            .set_status(&ctx.db, "disabled")
+            .await
+            .unwrap();
         assert_eq!(get_as(&request, "/api/me", &token).await.status_code(), 401);
     })
     .await;
@@ -122,7 +121,8 @@ async fn a_disabled_account_loses_access_immediately() {
 async fn a_user_who_must_change_their_password_can_only_change_it() {
     request::<App, _, _>(|request, ctx| async move {
         let user = make_user(&ctx, "a@brightcone.ai", Role::HrAdmin).await;
-        user.set_password(&database(&ctx), PASSWORD, true)
+        user.into_active_model()
+            .set_password(&ctx.db, PASSWORD, true)
             .await
             .unwrap();
         let (token, _) = sign_in(&request, "a@brightcone.ai").await;
@@ -145,7 +145,7 @@ async fn a_user_who_must_change_their_password_can_only_change_it() {
                 .status_code(),
             200
         );
-        let user = users::Model::find_by_email(&database(&ctx), "a@brightcone.ai")
+        let user = users::Model::find_by_email(&ctx.db, "a@brightcone.ai")
             .await
             .unwrap();
         assert!(!user.must_change_password);

@@ -21,7 +21,7 @@ server:
   # collide. Override without editing this file: `PORT=5151 cargo loco start`.
   port: <%= get_env(name="PORT", default="5150") %>
   # Binding for the server (which interface to bind to)
-  binding: <%= get_env(name="BINDING", default="0.0.0.0") %>
+  binding: <%= get_env(name="BINDING", default="localhost") %>
   # The UI hostname or IP address that mailers will point to.
   host: http://localhost
   # Out of the box middleware configuration. to disable middleware you can changed the `enable` field to `false` of comment the middleware block
@@ -67,7 +67,7 @@ queue:
   kind: Postgres
   
   # Postgres connection URI
-  uri: <%= get_env(name="QUEUE_URL", default="postgres://app_queue:queue_dev_pw@localhost:5433/brightcone_dev") %>
+  uri: <%= get_env(name="QUEUE_URL", default="postgres://app_queue:queue_dev_pw@localhost:5432/brightcone_dev") %>
   # Dangerously flush all data in the queue table on startup. dangerous operation, make sure that you using this flag only on dev environments or test mode
   dangerously_flush: false
   
@@ -75,8 +75,8 @@ queue:
 # Mailer Configuration.
 mailer:
   # Sending mail in development needs something listening on the port below.
-  # Run a local catcher -- mailpit, MailHog or maildev all default to SMTP on
-  # 1025 with a web inbox on 8025 -- e.g. `docker run -p 1025:1025 -p 8025:8025
+  # Run a local catcher — mailpit, MailHog or maildev all default to SMTP on
+  # 1025 with a web inbox on 8025 — e.g. `docker run -p 1025:1025 -p 8025:8025
   # axllent/mailpit`, then read the mail at http://localhost:8025.
   # Prefer not to run one? Set `stub: true` here (as `config/test.yaml` does)
   # to record deliveries in memory instead of sending them.
@@ -103,13 +103,33 @@ mailer:
 #      - client_identifier: google # Identifier for the OAuth2 provider. Replace 'google' with your provider's name if different, must be unique within the oauth2 config.
 #        ... other fields
 
+# Database Configuration
+database:
+  # Database connection URI
+  uri: <%= get_env(name="DATABASE_URL", default="postgres://app_runtime:runtime_dev_pw@localhost:5432/brightcone_dev") %>
+  # When enabled, the sql query will be logged.
+  enable_logging: <%= get_env(name="DB_LOGGING", default="false") %>
+  # Set the timeout duration when acquiring a connection.
+  connect_timeout: <%= get_env(name="DB_CONNECT_TIMEOUT", default="500") %>
+  # Set the idle duration before closing a connection.
+  idle_timeout: <%= get_env(name="DB_IDLE_TIMEOUT", default="500") %>
+  # Minimum number of connections for a pool.
+  min_connections: <%= get_env(name="DB_MIN_CONNECTIONS", default="1") %>
+  # Maximum number of connections for a pool.
+  max_connections: <%= get_env(name="DB_MAX_CONNECTIONS", default="1") %>
+  # Run migration up when application loaded
+  auto_migrate: false # migrations run as the app_migrator role: make migrate
+  # Truncate database when application loaded. This is a dangerous operation, make sure that you using this flag only on dev environments or test mode
+  dangerously_truncate: false
+  # Recreating schema when application loaded.  This is a dangerous operation, make sure that you using this flag only on dev environments or test mode
+  dangerously_recreate: false
+
 # Authentication Configuration
 auth:
   # JWT authentication
   jwt:
     # Secret key for token generation and verification
-    # Set a locally generated value in .env; never ship a shared signing key.
-    secret: <%= get_env(name="JWT_SECRET", default="dGhpc19pc19hX2RldmVsb3BtZW50X3NlY3JldF9mb3JfbG9jYWxfdXNlX29ubHlfMTIzNDU2Nzg5MDEyMzQ1Ng==") %>
+    secret: <%= get_env(name="JWT_SECRET", default="dev-only-secret-never-use-in-production") %>
     # Token expiration time in seconds
     expiration: 900 # 15 minutes. The refresh cookie keeps people signed in.
     # Where to read the token from. Omitted => `Authorization: Bearer <token>`.

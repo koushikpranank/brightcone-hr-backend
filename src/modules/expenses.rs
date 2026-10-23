@@ -126,7 +126,7 @@ pub async fn create_claim(
 ) -> (StatusCode, Json<ExpenseClaim>) {
     let mut claims = store.claims.write().await;
     let new_claim = ExpenseClaim {
-        id: format!("E-{}", &Uuid::new_v4().to_string()[..6].to_uppercase()),
+        id: format!("E-{}", Uuid::new_v4().to_string()[..6].to_uppercase()),
         employee_id: dto.employee_id.unwrap_or_else(|| "EMP-001".to_string()),
         employee_name: dto
             .employee_name

@@ -130,13 +130,13 @@ pub async fn csv(
     require_export_access(&auth)?;
     let db = Database::from_context(&ctx)?;
     let mut conn = db.get().await?;
-    let stats = sql_query("SELECT count(*)::bigint AS records, 0::bigint AS history, COALESCE(sum(pg_column_size(data)),0)::bigint AS data_bytes FROM hr_records WHERE ($1 OR archived_at IS NULL)")
+    let stats = sql_query("SELECT count(*)::bigint AS records, 0::bigint AS history, COALESCE(sum(pg_column_size(data)),0)::bigint AS data_bytes FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title') AND ($1 OR archived_at IS NULL)")
         .bind::<diesel::sql_types::Bool,_>(query.include_archived.unwrap_or(false))
         .get_result::<ExportStats>(&mut *conn).await.map_err(Database::map_error)?;
     if stats.records > EXPORT_LIMIT || stats.data_bytes > MAX_EXPORT_DATA_BYTES {
         return Err(payload_too_large());
     }
-    let rows = sql_query("SELECT id, record_type, source_id, data, archived_at::text AS archived_at, created_at::text AS created_at, updated_at::text AS updated_at FROM hr_records WHERE ($1 OR archived_at IS NULL) ORDER BY record_type, created_at DESC LIMIT $2")
+    let rows = sql_query("SELECT id, record_type, source_id, data, archived_at::text AS archived_at, created_at::text AS created_at, updated_at::text AS updated_at FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title') AND ($1 OR archived_at IS NULL) ORDER BY record_type, created_at DESC LIMIT $2")
         .bind::<diesel::sql_types::Bool,_>(query.include_archived.unwrap_or(false))
         .bind::<BigInt,_>(EXPORT_LIMIT).load::<Record>(&mut *conn).await.map_err(Database::map_error)?;
     let mut body =
@@ -185,7 +185,7 @@ pub async fn backup(auth: AuthUser, State(ctx): State<AppContext>) -> Result<Res
     require_export_access(&auth)?;
     let db = Database::from_context(&ctx)?;
     let mut conn = db.get().await?;
-    let stats = sql_query("SELECT (SELECT count(*)::bigint FROM hr_records) AS records, (SELECT count(*)::bigint FROM hr_record_history) AS history, ((SELECT COALESCE(sum(pg_column_size(data)),0) FROM hr_records) + (SELECT COALESCE(sum(COALESCE(pg_column_size(before_data),0)+COALESCE(pg_column_size(after_data),0)),0) FROM hr_record_history))::bigint AS data_bytes")
+    let stats = sql_query("SELECT (SELECT count(*)::bigint FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title')) AS records, (SELECT count(*)::bigint FROM hr_record_history h JOIN hr_records r ON r.id=h.record_id WHERE r.record_type NOT LIKE 'employee%' AND r.record_type NOT IN ('department','grade','location','job_title')) AS history, ((SELECT COALESCE(sum(pg_column_size(data)),0) FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title')) + (SELECT COALESCE(sum(COALESCE(pg_column_size(h.before_data),0)+COALESCE(pg_column_size(h.after_data),0)),0) FROM hr_record_history h JOIN hr_records r ON r.id=h.record_id WHERE r.record_type NOT LIKE 'employee%' AND r.record_type NOT IN ('department','grade','location','job_title')))::bigint AS data_bytes")
         .get_result::<ExportStats>(&mut *conn).await.map_err(Database::map_error)?;
     if stats.records > EXPORT_LIMIT
         || stats.history > 100_000
@@ -193,9 +193,9 @@ pub async fn backup(auth: AuthUser, State(ctx): State<AppContext>) -> Result<Res
     {
         return Err(payload_too_large());
     }
-    let rows = sql_query("SELECT id, record_type, source_id, data, archived_at::text AS archived_at, COALESCE(created_by,0) AS created_by, COALESCE(updated_by,0) AS updated_by FROM hr_records ORDER BY id LIMIT $1")
+    let rows = sql_query("SELECT id, record_type, source_id, data, archived_at::text AS archived_at, COALESCE(created_by,0) AS created_by, COALESCE(updated_by,0) AS updated_by FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title') ORDER BY id LIMIT $1")
         .bind::<BigInt,_>(EXPORT_LIMIT).load::<BackupRecord>(&mut *conn).await.map_err(Database::map_error)?;
-    let history = sql_query("SELECT record_id, action, COALESCE(source_actor_user_id, actor_user_id) AS source_actor_user_id, before_data, after_data, created_at::text AS created_at FROM hr_record_history ORDER BY id")
+    let history = sql_query("SELECT h.record_id, h.action, COALESCE(h.source_actor_user_id, h.actor_user_id) AS source_actor_user_id, h.before_data, h.after_data, h.created_at::text AS created_at FROM hr_record_history h JOIN hr_records r ON r.id=h.record_id WHERE r.record_type NOT LIKE 'employee%' AND r.record_type NOT IN ('department','grade','location','job_title') ORDER BY h.id")
         .load::<BackupHistory>(&mut *conn).await.map_err(Database::map_error)?;
     json_download(&BackupDocument {
         format_version: 2,
@@ -221,6 +221,16 @@ pub async fn import(
         ));
     }
     for row in &mut backup.records {
+        if row.record_type.starts_with("employee")
+            || matches!(
+                row.record_type.as_str(),
+                "department" | "grade" | "location" | "job_title"
+            )
+        {
+            return Err(Error::BadRequest(
+                "People records must be imported through the People API.".to_owned(),
+            ));
+        }
         if row.source_id.trim().is_empty() || row.source_id.len() > 128 {
             return Err(Error::BadRequest(
                 "Backup contains an invalid source_id.".to_owned(),

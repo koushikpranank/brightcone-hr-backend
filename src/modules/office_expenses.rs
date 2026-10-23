@@ -119,7 +119,7 @@ pub async fn create_office_expense(
     let total_amount = dto.base_amount + gst_amount;
 
     let new_expense = OfficeExpense {
-        id: format!("OE-{}", &Uuid::new_v4().to_string()[..5].to_uppercase()),
+        id: format!("OE-{}", Uuid::new_v4().to_string()[..5].to_uppercase()),
         vendor_name: dto.vendor_name,
         category: dto.category,
         invoice_no: dto.invoice_no,

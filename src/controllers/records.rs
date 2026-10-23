@@ -80,11 +80,16 @@ fn require_hr(auth: &AuthUser) -> Result<()> {
 }
 
 fn validate_type(record_type: &str) -> Result<()> {
-    if records::is_registered(record_type) {
+    if records::is_registered(record_type) && !is_people_record(record_type) {
         Ok(())
     } else {
         Err(Error::BadRequest("Unknown record type.".to_owned()))
     }
+}
+
+fn is_people_record(kind: &str) -> bool {
+    kind.starts_with("employee")
+        || matches!(kind, "department" | "grade" | "location" | "job_title")
 }
 
 fn validate_input(record_type: &str, input: &RecordInput) -> Result<serde_json::Value> {
@@ -182,6 +187,9 @@ async fn change(
     let (row, event_id) = conn.transaction::<(Record, Option<Uuid>), ModelError, _>(async move |conn| {
         let old = sql_query("SELECT id, record_type, source_id, data, archived_at::text AS archived_at, created_at::text AS created_at, updated_at::text AS updated_at FROM hr_records WHERE id=$1 FOR UPDATE")
             .bind::<SqlUuid, _>(id).get_result::<Record>(&mut *conn).await?;
+        if is_people_record(&old.record_type) {
+            return Err(ModelError::Validation("People records require the typed People API".to_owned()));
+        }
         let new_data = match input {
             Some(value) => records::validate_record(&old.record_type, &value)
                 .map_err(ModelError::Validation)?,
@@ -268,6 +276,11 @@ pub async fn history(
     require_hr(&auth)?;
     let db = Database::from_context(&ctx)?;
     let mut conn = db.get().await?;
+    let record = sql_query("SELECT record_type, ''::text AS source_id, '{}'::jsonb AS data, NULL::text AS archived_at, ''::text AS created_at, ''::text AS updated_at, id FROM hr_records WHERE id=$1")
+        .bind::<SqlUuid,_>(id).get_result::<Record>(&mut *conn).await.map_err(Database::map_error)?;
+    if is_people_record(&record.record_type) {
+        return Err(Error::NotFound);
+    }
     let rows = sql_query("SELECT id, record_id, action, actor_user_id, before_data, after_data, created_at::text AS created_at FROM hr_record_history WHERE record_id=$1 ORDER BY id DESC LIMIT 500")
         .bind::<SqlUuid,_>(id).load::<HistoryEntry>(&mut *conn).await.map_err(Database::map_error)?;
     format::json(rows)
@@ -276,9 +289,9 @@ pub async fn history(
 pub fn routes() -> Routes {
     Routes::new()
         .prefix("/api/records")
-        .add("/:record_type", get(list).post(create))
-        .add("/:id", put(update))
-        .add("/:id/archive", post(archive))
-        .add("/:id/restore", post(restore))
-        .add("/:id/history", get(history))
+        .add("/{record_type}", get(list).post(create))
+        .add("/{id}", put(update))
+        .add("/{id}/archive", post(archive))
+        .add("/{id}/restore", post(restore))
+        .add("/{id}/history", get(history))
 }

@@ -4,7 +4,6 @@ use loco_rs::{hash, prelude::*};
 use crate::{
     audit::{self, Entry},
     authz::AuthUser,
-    database::Database,
     models::{refresh_tokens, users::check_password_strength},
     request_meta::RequestMeta,
     session::session_response,
@@ -47,7 +46,6 @@ pub async fn change_password(
     meta: RequestMeta,
     Json(params): Json<ChangePasswordParams>,
 ) -> Result<Response> {
-    let db = Database::from_context(&ctx)?;
     let settings = AppSettings::from_ctx(&ctx);
     let hash_value = auth.user.password.clone();
     let current = params.current_password.clone();
@@ -66,13 +64,15 @@ pub async fn change_password(
 
     let user = auth
         .user
-        .set_password(&db, &params.new_password, false)
+        .into_active_model()
+        .set_password(&ctx.db, &params.new_password, false)
         .await?;
-    refresh_tokens::Model::revoke_all_for_user(&db, user.id).await?;
+    refresh_tokens::Model::revoke_all_for_user(&ctx.db, user.id).await?;
     let issued =
-        refresh_tokens::Model::issue(&db, &settings, user.id, None, false, meta.ip.clone()).await?;
+        refresh_tokens::Model::issue(&ctx.db, &settings, user.id, None, false, meta.ip.clone())
+            .await?;
     audit::record(
-        &db,
+        &ctx.db,
         Some(&user),
         &meta,
         Entry::new("user.password_changed").target("user", user.pid),

@@ -17,7 +17,6 @@ use serde::Deserialize;
 use crate::{
     audit::{self, Entry},
     authz::forbidden,
-    database::Database,
     mailers::auth::AuthMailer,
     models::{
         password_resets,
@@ -79,17 +78,16 @@ pub async fn login(
     meta: RequestMeta,
     Json(params): Json<LoginParams>,
 ) -> Result<Response> {
-    let db = Database::from_context(&ctx)?;
     let settings = AppSettings::from_ctx(&ctx);
     if params.email.trim().is_empty() || params.password.is_empty() || params.password.len() > 1024
     {
         return bad_request("Enter your work email and password.");
     }
 
-    let Ok(user) = users::Model::find_by_email(&db, &params.email).await else {
+    let Ok(user) = users::Model::find_by_email(&ctx.db, &params.email).await else {
         check_password(dummy_hash().to_owned(), params.password).await;
         audit::record(
-            &db,
+            &ctx.db,
             None,
             &meta,
             Entry::new("auth.login_failed").summary(format!(
@@ -103,7 +101,7 @@ pub async fn login(
 
     if !check_password(user.password.clone(), params.password).await {
         audit::record(
-            &db,
+            &ctx.db,
             Some(&user),
             &meta,
             Entry::new("auth.login_failed").target("user", user.pid),
@@ -111,12 +109,12 @@ pub async fn login(
         .await?;
         if user.status == "active" {
             let updated =
-                users::Model::register_failed_login(&db, user.id, settings.lockout_threshold)
+                users::Model::register_failed_login(&ctx.db, user.id, settings.lockout_threshold)
                     .await?;
             if updated.status == "locked" {
-                refresh_tokens::Model::revoke_all_for_user(&db, user.id).await?;
+                refresh_tokens::Model::revoke_all_for_user(&ctx.db, user.id).await?;
                 audit::record(
-                    &db,
+                    &ctx.db,
                     Some(&updated),
                     &meta,
                     Entry::new("auth.account_locked")
@@ -145,9 +143,12 @@ pub async fn login(
         _ => {}
     }
 
-    let user = user.record_login_success(&db).await?;
+    let user = user
+        .into_active_model()
+        .record_login_success(&ctx.db)
+        .await?;
     let issued = refresh_tokens::Model::issue(
-        &db,
+        &ctx.db,
         &settings,
         user.id,
         None,
@@ -156,7 +157,7 @@ pub async fn login(
     )
     .await?;
     audit::record(
-        &db,
+        &ctx.db,
         Some(&user),
         &meta,
         Entry::new("auth.login").target("user", user.pid),
@@ -180,19 +181,18 @@ pub async fn refresh(
     meta: RequestMeta,
     headers: HeaderMap,
 ) -> Result<Response> {
-    let db = Database::from_context(&ctx)?;
     require_csrf_header(&headers)?;
     let settings = AppSettings::from_ctx(&ctx);
     let Some(secret) = read_cookie(&headers) else {
         return unauthorized_clearing(&settings);
     };
 
-    match refresh_tokens::Model::rotate(&db, &settings, &secret, meta.ip.clone()).await? {
+    match refresh_tokens::Model::rotate(&ctx.db, &settings, &secret, meta.ip.clone()).await? {
         Rotation::Invalid => unauthorized_clearing(&settings),
         Rotation::Reused { user_id } => {
-            let user = users::Model::find_optional_by_id(&db, user_id).await?;
+            let user = users::Entity::find_by_id(user_id).one(&ctx.db).await?;
             audit::record(
-                &db,
+                &ctx.db,
                 user.as_ref(),
                 &meta,
                 Entry::new("auth.refresh_reuse").summary(
@@ -203,13 +203,15 @@ pub async fn refresh(
             unauthorized_clearing(&settings)
         }
         Rotation::Rotated(issued) => {
-            let user = users::Model::find_optional_by_id(&db, issued.user_id).await?;
+            let user = users::Entity::find_by_id(issued.user_id)
+                .one(&ctx.db)
+                .await?;
             match user {
                 Some(user) if user.status == "active" => {
                     session_response(&ctx, &settings, &user, &issued)
                 }
                 _ => {
-                    refresh_tokens::Model::revoke_all_for_user(&db, issued.user_id).await?;
+                    refresh_tokens::Model::revoke_all_for_user(&ctx.db, issued.user_id).await?;
                     unauthorized_clearing(&settings)
                 }
             }
@@ -238,18 +240,17 @@ pub async fn logout(
     headers: HeaderMap,
     Query(query): Query<LogoutQuery>,
 ) -> Result<Response> {
-    let db = Database::from_context(&ctx)?;
     require_csrf_header(&headers)?;
     let settings = AppSettings::from_ctx(&ctx);
 
     if let Some(secret) = read_cookie(&headers) {
-        if let Some(user_id) = refresh_tokens::Model::revoke_by_secret(&db, &secret).await? {
+        if let Some(user_id) = refresh_tokens::Model::revoke_by_secret(&ctx.db, &secret).await? {
             if query.all {
-                refresh_tokens::Model::revoke_all_for_user(&db, user_id).await?;
+                refresh_tokens::Model::revoke_all_for_user(&ctx.db, user_id).await?;
             }
-            let user = users::Model::find_optional_by_id(&db, user_id).await?;
+            let user = users::Entity::find_by_id(user_id).one(&ctx.db).await?;
             audit::record(
-                &db,
+                &ctx.db,
                 user.as_ref(),
                 &meta,
                 Entry::new(if query.all {
@@ -279,18 +280,18 @@ pub async fn forgot(
     meta: RequestMeta,
     Json(params): Json<ForgotParams>,
 ) -> Result<Response> {
-    let db = Database::from_context(&ctx)?;
     let settings = AppSettings::from_ctx(&ctx);
-    if let Ok(user) = users::Model::find_by_email(&db, &params.email).await {
+    if let Ok(user) = users::Model::find_by_email(&ctx.db, &params.email).await {
         if user.status != "disabled" {
             let secret =
-                password_resets::Model::issue(&db, user.id, settings.reset_token_minutes).await?;
+                password_resets::Model::issue(&ctx.db, user.id, settings.reset_token_minutes)
+                    .await?;
             // A mail failure must not change the answer either.
             if let Err(err) = AuthMailer::send_password_reset(&ctx, &user, &secret).await {
                 tracing::error!(error = %err, "could not send the password reset email");
             }
             audit::record(
-                &db,
+                &ctx.db,
                 Some(&user),
                 &meta,
                 Entry::new("auth.password_reset_requested").target("user", user.pid),
@@ -319,21 +320,23 @@ pub async fn reset(
     meta: RequestMeta,
     Json(params): Json<ResetParams>,
 ) -> Result<Response> {
-    let db = Database::from_context(&ctx)?;
     if let Err(message) = check_password_strength(&params.password) {
         return bad_request(message);
     }
-    let Some(user_id) = password_resets::Model::consume(&db, &params.token).await? else {
+    let Some(user_id) = password_resets::Model::consume(&ctx.db, &params.token).await? else {
         return bad_request("This link is invalid or has expired. Request a new one.");
     };
-    let Ok(user) = users::Model::find_by_id(&db, user_id).await else {
+    let Some(user) = users::Entity::find_by_id(user_id).one(&ctx.db).await? else {
         return bad_request("This link is invalid or has expired. Request a new one.");
     };
 
-    let user = user.set_password(&db, &params.password, false).await?;
-    refresh_tokens::Model::revoke_all_for_user(&db, user.id).await?;
+    let user = user
+        .into_active_model()
+        .set_password(&ctx.db, &params.password, false)
+        .await?;
+    refresh_tokens::Model::revoke_all_for_user(&ctx.db, user.id).await?;
     audit::record(
-        &db,
+        &ctx.db,
         Some(&user),
         &meta,
         Entry::new("auth.password_reset").target("user", user.pid),

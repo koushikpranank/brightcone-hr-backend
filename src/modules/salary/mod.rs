@@ -181,6 +181,12 @@ impl SalaryStore {
     }
 }
 
+impl Default for SalaryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub async fn calculate_salary(Json(dto): Json<CalculateSalaryDto>) -> Json<SalaryBreakdown> {
     let pf_capped = dto.pf_capped.unwrap_or(true);
     let regime = dto.tax_regime.unwrap_or_else(|| "new".to_string());
@@ -202,7 +208,7 @@ pub async fn create_structure(
     let regime = dto.tax_regime.clone().unwrap_or_else(|| "New".to_string());
     let calc = compute_salary_in_paise(dto.gross_monthly, pf_capped, &regime);
 
-    let new_id = format!("STR-{}", &Uuid::new_v4().to_string()[..6].to_uppercase());
+    let new_id = format!("STR-{}", Uuid::new_v4().to_string()[..6].to_uppercase());
 
     for s in structures.iter_mut() {
         if s.employee_id == dto.employee_id && s.is_active {
@@ -255,7 +261,7 @@ pub async fn propose_revision(
     };
 
     let new_rev = SalaryRevision {
-        id: format!("REV-{}", &Uuid::new_v4().to_string()[..5].to_uppercase()),
+        id: format!("REV-{}", Uuid::new_v4().to_string()[..5].to_uppercase()),
         employee_id: dto.employee_id,
         employee_name: dto.employee_name,
         current_gross: dto.current_gross,
@@ -313,7 +319,7 @@ pub async fn approve_revision(
 
     let mut history = store.increment_history.write().await;
     let history_entry = IncrementHistoryRecord {
-        id: format!("INC-{}", &Uuid::new_v4().to_string()[..5].to_uppercase()),
+        id: format!("INC-{}", Uuid::new_v4().to_string()[..5].to_uppercase()),
         employee_id: emp_id.clone(),
         employee_name: emp_name.clone(),
         previous_gross: prev_gross,
@@ -329,7 +335,7 @@ pub async fn approve_revision(
     history.insert(0, history_entry);
 
     let mut structures = store.structures.write().await;
-    let new_struct_id = format!("STR-{}", &Uuid::new_v4().to_string()[..6].to_uppercase());
+    let new_struct_id = format!("STR-{}", Uuid::new_v4().to_string()[..6].to_uppercase());
 
     let mut department = "Engineering".to_string();
     for s in structures.iter_mut() {

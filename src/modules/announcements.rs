@@ -101,7 +101,7 @@ pub async fn create_announcement(
 ) -> (StatusCode, Json<Announcement>) {
     let mut items = store.announcements.write().await;
     let new_item = Announcement {
-        id: format!("A-{}", &Uuid::new_v4().to_string()[..5].to_uppercase()),
+        id: format!("A-{}", Uuid::new_v4().to_string()[..5].to_uppercase()),
         title: dto.title,
         body: dto.body,
         pinned: dto.pinned.unwrap_or(false),

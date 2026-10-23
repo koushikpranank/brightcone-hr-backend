@@ -31,12 +31,11 @@ jobs:
           --health-retries 10
 
     env:
-      # Same isolated roles and databases as local development (docker/postgres-init/01-roles.sh)
-      TEST_DATABASE_URL: postgres://app_schema_sync:schema_sync_dev_pw@localhost:5432/brightcone_test
-      TEST_QUEUE_URL: postgres://app_queue:queue_dev_pw@localhost:5432/brightcone_test
+      # Same two roles and databases as local development (docker/postgres-init/01-roles.sh)
+      TEST_DATABASE_URL: postgres://app_migrator:migrator_dev_pw@localhost:5432/brightcone_test
       DATABASE_URL: postgres://app_runtime:runtime_dev_pw@localhost:5432/brightcone_dev
-      SCHEMA_SYNC_DATABASE_URL: postgres://app_schema_sync:schema_sync_dev_pw@localhost:5432/brightcone_dev
       QUEUE_URL: postgres://app_queue:queue_dev_pw@localhost:5432/brightcone_dev
+      MIGRATION_DATABASE_URL:postgres://app_migrator:migrator_dev_pw@localhost:5432/brightcone_dev
 
     steps:
       - uses: actions/checkout@v4
@@ -51,23 +50,19 @@ jobs:
       - name: Create database roles and databases
         run: |
           export PGPASSWORD=postgres
-          SCHEMA_SYNC_PASSWORD=schema_sync_dev_pw RUNTIME_PASSWORD=runtime_dev_pw QUEUE_PASSWORD=queue_dev_pw \
+          MIGRATOR_PASSWORD=migrator_dev_pw RUNTIME_PASSWORD=runtime_dev_pw QUEUE_PASSWORD=queue_dev_pw \
           POSTGRES_USER=postgres PGHOST=localhost bash docker/postgres-init/01-roles.sh
 
       - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Source line limit
-        run: |
-          rustfmt --edition 2021 --check scripts/check_line_limits.rs
-          mkdir -p target
-          rustc --edition=2021 scripts/check_line_limits.rs -o target/check_line_limits.exe
-          target/check_line_limits.exe
-
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
 
-      - name: App starts with additive schema sync and /api/health answers
+      - name: Migrate dev database as app_migrator
+        run: DATABASE_URL="$MIGRATION_DATABASE_URL" cargo run --quiet -- db migrate
+
+      - name: App starts as the restricted app_runtime role and /api/health answers
         run: |
           cargo run --quiet -- start > app.log 2>&1 &
           for i in $(seq 1 90); do

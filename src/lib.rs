@@ -10,6 +10,7 @@ pub mod mailers;
 pub mod models;
 pub mod modules;
 pub mod openapi;
+pub mod people;
 pub mod rate_limit;
 pub mod records;
 pub mod request_meta;

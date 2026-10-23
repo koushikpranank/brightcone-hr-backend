@@ -76,5 +76,5 @@ pub fn routes() -> Routes {
     Routes::new()
         .prefix("/api/notifications")
         .add("/", get(list))
-        .add("/:id/read", post(mark_read))
+        .add("/{id}/read", post(mark_read))
 }

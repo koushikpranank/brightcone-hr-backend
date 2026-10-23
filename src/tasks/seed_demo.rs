@@ -2,7 +2,6 @@ use loco_rs::{environment::Environment, hash, prelude::*};
 
 use crate::{
     authz::Role,
-    database::Database,
     models::users::{self, NewUser},
 };
 
@@ -51,16 +50,15 @@ impl Task for SeedDemo {
         if ctx.environment == Environment::Production {
             return Err(Error::string("seed_demo must never run in production"));
         }
-        let db = Database::from_context(ctx)?;
         for (name, role) in PEOPLE {
             let email = email_for(name);
-            if users::Model::find_by_email(&db, &email).await.is_ok() {
+            if users::Model::find_by_email(&ctx.db, &email).await.is_ok() {
                 println!("skip    {email} (already exists)");
                 continue;
             }
             let password = format!("{}-Aa1", hash::random_string(16));
             users::Model::create_with_password(
-                &db,
+                &ctx.db,
                 &NewUser {
                     email: email.clone(),
                     name: (*name).to_owned(),

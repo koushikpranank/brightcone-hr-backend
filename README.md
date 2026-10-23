@@ -1,92 +1,76 @@
-# Brightcone HR API
+# Brightcone People: Backend
 
-Rust/Loco API with PostgreSQL. The current release is a platform foundation for authentication and administration; it is **not a complete HR suite or production-ready for employee/payroll data**. See [STATUS.md](STATUS.md) and [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) for shipped scope and release gaps.
+Rust + [Loco](https://loco.rs) API with PostgreSQL for the Brightcone HR portal. The frontend lives in `brightcone-hr-frontend`.
 
-## Implemented API
+## Loco decisions (ticket P0-01)
 
-Paths are relative to the API origin. Authenticated requests use `Authorization: Bearer <access-token>`. Cookie-authenticated refresh/logout requests also require the configured CSRF token/header.
+| Question | Answer for this project |
+|---|---|
+| Loco version | `loco-rs 1.2` (pinned in `Cargo.toml` / `Cargo.lock`) |
+| Rust version | `1.99.0` (pinned in `rust-toolchain.toml`) |
+| Database | PostgreSQL 16, SeaORM 2 |
+| Background queue | **Postgres-backed** (`queue: kind: Postgres`), so no Redis is needed |
+| Mailer | SMTP (local: Mailpit catcher on port 1025, inbox at http://localhost:8025) |
+| Auth helpers | Loco ships a sample `auth` controller (register/login/JWT). **Ticket P1-04 to P1-07 replace it** with our own login, refresh-cookie and logout flow |
 
-| Method | Path | Access | Purpose |
-|---|---|---|---|
-| GET | `/api/health` | Public | API and database health |
-| POST | `/api/auth/login` | Public | Sign in; issue access JWT and refresh cookie |
-| POST | `/api/auth/refresh` | Refresh cookie + CSRF | Rotate refresh token |
-| POST | `/api/auth/logout?all={bool}` | Refresh cookie + CSRF | Revoke current or all sessions |
-| POST | `/api/auth/forgot` | Public | Request password reset |
-| POST | `/api/auth/reset` | Reset token | Set a new password |
-| GET | `/api/me` | Authenticated | Current identity and effective permissions |
-| PUT | `/api/me/password` | Authenticated | Change current password |
-| GET | `/api/admin/users` | `users:manage` | List users |
-| POST | `/api/admin/users` | `users:manage` | Create user |
-| POST | `/api/admin/users/{pid}/unlock` | `users:manage` | Unlock account |
-| POST | `/api/admin/users/{pid}/disable` | `users:manage` | Disable account and revoke sessions |
-| PUT | `/api/admin/users/{pid}/role` | `users:manage` | Change user role |
-| POST | `/api/admin/users/{pid}/reset-password` | `users:manage` | Issue temporary password and revoke sessions |
-| GET | `/api/audit` | `audit:read` | Read audit events |
+## Run it
 
-The OpenAPI document is the contract for request/response fields. There are no active Files or Approvals HTTP routes. Their current prototypes are in-memory and intentionally not mounted; do not use them for real data.
-
-## Local development
-
-Requirements: Rust toolchain from `rust-toolchain.toml`, Docker Desktop, Node.js/npm for the frontend, and Windows MSVC C++ build tools on Windows.
-
-From this directory in PowerShell:
-
-```powershell
-Copy-Item .env.example .env
+### Option A: you have Rust and the MSVC/C++ build tools (or you use Linux/macOS)
+```bash
+cp .env.example .env
+make db-up          # Postgres + Mailpit in Docker
+make migrate        # migrations as the app_migrator role
+make run            # http://localhost:5150
+curl http://localhost:5150/api/health
 ```
 
-Generate a unique local signing secret and put it in ignored `.env`:
-
-```powershell
-openssl rand -base64 48
-```
-
-Never commit `.env` or reuse demo credentials outside disposable local development.
-
-```powershell
+### Option B: no Rust install (Docker only)
+```bash
+cp .env.example .env
 docker compose up -d --wait postgres mailpit
-make run        # API on http://localhost:5150
-# In another terminal, optionally create local-only demo accounts:
-make seed       # prints temporary passwords to terminal
+docker compose --profile app run --rm -e DATABASE_URL=postgres://app_migrator:migrator_dev_pw@postgres:5432/brightcone_dev api cargo run -- db migrate
+docker compose --profile app up api
+```
+The first build takes a long time (about 20 minutes); later builds are fast because the compiled files live in a Docker volume.
+
+No `make`? Each target in the [Makefile](Makefile) is one or two plain commands.
+
+## Two database roles, on purpose
+| Role | Can do | Used by |
+|---|---|---|
+| `app_migrator` | Create and change tables | `make migrate`, tests |
+| `app_runtime` | Read and write rows only (cannot CREATE/ALTER/DROP) | the running API |
+| `app_queue` | Create objects only inside its own `queue` schema | the Postgres job queue (Loco creates its queue tables at start-up) |
+
+So a bug or an attack on the running app cannot change or drop the table structure. The roles are created by `docker/postgres-init/01-roles.sh` the first time the Postgres volume is created. To start again from scratch: `make db-reset`.
+
+## Environment variables
+See [.env.example](.env.example). Development has safe defaults; **production refuses to start without** `DATABASE_URL`, `QUEUE_URL`, `JWT_SECRET`, `HOST`, `MAILER_HOST`.
+
+Tests use `TEST_DATABASE_URL` (the `brightcone_test` database) and **wipe it**. They never read `DATABASE_URL`, so they cannot erase your dev data.
+
+## API documentation
+- Endpoints are listed in `src/openapi.rs`; the committed [openapi.json](openapi.json) is the contract.
+- In development, `GET /api/openapi.json` serves it (not mounted in production).
+- A test and CI fail when `openapi.json` is stale. Fix with `make openapi`, then copy the file to the frontend repo and run `npm run gen:api`.
+
+## Checks (same as CI)
+```bash
+make lint   # cargo fmt --check + clippy -D warnings
+make test   # needs the test database from make db-up
+cargo audit && cargo deny check
 ```
 
-The API applies additive schema sync at startup. `SCHEMA_SYNC_DATABASE_URL` must
-identify a PostgreSQL role permitted to create tables, add columns, and create
-indexes. The API uses the lower-privilege `DATABASE_URL` for normal queries.
-In production, provision these credentials separately; schema sync never drops
-tables or columns. Review `src/database/schema/manifest.rs` before deploying schema changes.
-
-The Vite frontend defaults to proxying `/api` to `http://localhost:5150`. Mailpit is available at `http://localhost:8025`.
-
-## Checks
-
-```powershell
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-make line-limit
+## Project layout
+```
+src/controllers/   thin handlers (health, docs, auth sample)
+src/models/        database models (generated by Loco)
+src/views/         JSON response types (never return raw entities)
+src/openapi.rs     API contract
+migration/         database change scripts
+config/            development / test / production yaml (secrets via env)
+docker/            Postgres init script (roles + databases)
+tests/             API and model tests
 ```
 
-For Docker-only backend commands, see `make help` and the Makefile. Run these checks on a clean environment before merging; native Windows dependencies can require MSVC and a writable Cargo target directory.
-
-## Structure
-
-```text
-src/app.rs                 routes, middleware and worker registration
-src/database.rs            Diesel pool and startup schema-sync lifecycle hook
-src/database/schema/       additive PostgreSQL schema manifest and sync logic
-src/controllers/           HTTP request handlers
-src/dtos/                  request and response contracts
-src/models/                persistent database models
-src/{authz,audit,session}/ shared auth, authorization and audit services
-src/workers/               queued background workers
-config/                    development, test and production configuration
-docker/                    local PostgreSQL roles and initialization
-tests/                     API and integration tests
-scripts/                   source-size enforcement
-```
-
-## Security and scope
-
-Secrets are read from environment/config; the development JWT fallback was removed. Use HTTPS and production cookie settings in deployment. Current roles are global, not tenant-scoped. The rate limiter is process-local. HR domain records, durable file metadata/storage, and team-scoped approvals are not implemented. Review the assessment before exposing this API publicly.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for branch names and rules. `AGENTS.md` and `.claude/skills/loco/` are Loco's own guides for AI coding assistants and are safe to keep.

@@ -1,18 +1,16 @@
-//! Audit log service. Passwords, tokens and full salary figures never enter summaries.
-use diesel::{
-    sql_query,
-    sql_types::{BigInt, Nullable, Text},
-};
-use diesel_async::RunQueryDsl;
+//! Audit log service (ticket P1-09). Every write endpoint records what happened through [`record`].
+//!
+//! Never put passwords, tokens or full salary figures in `summary`.
 use loco_rs::prelude::*;
 
 use crate::{
-    database::Database,
-    models::{error::ModelError, users},
+    models::{_entities::audit_logs, users},
     request_meta::RequestMeta,
 };
 
+/// One thing that happened.
 pub struct Entry<'a> {
+    /// Dotted verb, e.g. `auth.login`, `user.disabled`.
     pub action: &'a str,
     pub target_type: Option<&'a str>,
     pub target_id: Option<String>,
@@ -44,28 +42,29 @@ impl<'a> Entry<'a> {
     }
 }
 
-pub async fn record(
-    db: &Database,
+/// Appends an entry. `actor` is `None` for events before anyone is signed in (a failed login).
+///
+/// # Errors
+/// When the insert fails. Callers on security-critical paths should propagate this: an action that
+/// cannot be recorded should not silently succeed.
+pub async fn record<C: ConnectionTrait>(
+    db: &C,
     actor: Option<&users::Model>,
     meta: &RequestMeta,
     entry: Entry<'_>,
 ) -> Result<()> {
-    let mut conn = db.get().await?;
-    sql_query(
-        "INSERT INTO audit_logs \
-         (actor_user_id, actor_email, action, target_type, target_id, summary, ip, request_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-    )
-    .bind::<Nullable<BigInt>, _>(actor.map(|user| user.id))
-    .bind::<Nullable<Text>, _>(actor.map(|user| user.email.clone()))
-    .bind::<Text, _>(entry.action)
-    .bind::<Nullable<Text>, _>(entry.target_type)
-    .bind::<Nullable<Text>, _>(entry.target_id)
-    .bind::<Nullable<Text>, _>(entry.summary)
-    .bind::<Nullable<Text>, _>(meta.ip.clone())
-    .bind::<Nullable<Text>, _>(meta.request_id.clone())
-    .execute(&mut *conn)
-    .await
-    .map_err(ModelError::from)?;
+    audit_logs::ActiveModel {
+        actor_user_id: ActiveValue::set(actor.map(|u| u.id)),
+        actor_email: ActiveValue::set(actor.map(|u| u.email.clone())),
+        action: ActiveValue::set(entry.action.to_owned()),
+        target_type: ActiveValue::set(entry.target_type.map(str::to_owned)),
+        target_id: ActiveValue::set(entry.target_id),
+        summary: ActiveValue::set(entry.summary),
+        ip: ActiveValue::set(meta.ip.clone()),
+        request_id: ActiveValue::set(meta.request_id.clone()),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
     Ok(())
 }

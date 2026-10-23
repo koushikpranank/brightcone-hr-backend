@@ -1,49 +1,23 @@
 //! Account administration for HR (ticket P1-11): create, unlock, disable, change role, reset password.
 //! Every action is audited and revokes sessions where that makes sense.
-use diesel::{prelude::QueryableByName, sql_query, sql_types::BigInt};
-use diesel_async::RunQueryDsl;
-use loco_rs::{hash, prelude::*};
+use loco_rs::{
+    hash,
+    model::query::{self, PaginationQuery},
+    prelude::*,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
     audit::{self, Entry},
     authz::{AuthUser, Role},
-    database::Database,
     models::{
-        error::ModelError,
+        _entities::users::Column as UserColumn,
         refresh_tokens,
         users::{self, NewUser},
     },
     request_meta::RequestMeta,
 };
-
-#[derive(QueryableByName)]
-struct CountRow {
-    #[diesel(sql_type = BigInt)]
-    count: i64,
-}
-
-#[derive(Serialize)]
-struct UserPage {
-    results: Vec<AdminUserResponse>,
-    #[serde(rename = "pagination")]
-    meta: PaginationMeta,
-}
-
-#[derive(Serialize)]
-struct PaginationMeta {
-    page: u64,
-    page_size: u64,
-    total_pages: u64,
-    total_items: u64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PaginationQuery {
-    page: Option<u64>,
-    page_size: Option<u64>,
-}
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AdminUserResponse {
@@ -101,8 +75,7 @@ fn temporary_password() -> String {
 }
 
 pub async fn find(ctx: &AppContext, pid: &str) -> Result<users::Model> {
-    let db = Database::from_context(ctx)?;
-    users::Model::find_by_pid(&db, pid)
+    users::Model::find_by_pid(&ctx.db, pid)
         .await
         .map_err(|_| Error::NotFound)
 }
@@ -112,17 +85,12 @@ pub async fn ensure_other_hr_admin(ctx: &AppContext, user: &users::Model) -> Res
     if user.role != Role::HrAdmin.as_str() || user.status != "active" {
         return Ok(());
     }
-    let db = Database::from_context(ctx)?;
-    let mut conn = db.get().await?;
-    let others = sql_query(
-        "SELECT count(*) AS count FROM users WHERE role = $1 AND status = 'active' AND id <> $2",
-    )
-    .bind::<diesel::sql_types::Text, _>(Role::HrAdmin.as_str())
-    .bind::<diesel::sql_types::BigInt, _>(user.id)
-    .get_result::<CountRow>(&mut *conn)
-    .await
-    .map_err(Database::map_error)?
-    .count;
+    let others = users::Entity::find()
+        .filter(UserColumn::Role.eq(Role::HrAdmin.as_str()))
+        .filter(UserColumn::Status.eq("active"))
+        .filter(UserColumn::Id.ne(user.id))
+        .count(&ctx.db)
+        .await?;
     if others == 0 {
         return bad_request("There must always be at least one active HR Admin.");
     }
@@ -143,36 +111,15 @@ pub async fn list(
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<Response> {
     auth.require("users:manage")?;
-    let db = Database::from_context(&ctx)?;
-    let page_size = pagination.page_size.unwrap_or(25).clamp(1, 100);
-    let page = pagination.page.unwrap_or(1).max(1);
-    let offset = page.saturating_sub(1).saturating_mul(page_size);
-    let mut conn = db.get().await?;
-    let count = sql_query("SELECT count(*) AS count FROM users")
-        .get_result::<CountRow>(&mut *conn)
-        .await
-        .map_err(Database::map_error)?
-        .count;
-    let rows = sql_query(format!(
-        "{} ORDER BY id LIMIT $1 OFFSET $2",
-        users::USER_SELECT
-    ))
-    .bind::<BigInt, _>(i64::try_from(page_size).unwrap_or(100))
-    .bind::<BigInt, _>(i64::try_from(offset).unwrap_or(i64::MAX))
-    .load::<users::Model>(&mut *conn)
-    .await
-    .map_err(Database::map_error)?;
-    let items: Vec<AdminUserResponse> = rows.iter().map(AdminUserResponse::from).collect();
-    let total_pages = u64::try_from(count).unwrap_or(0).div_ceil(page_size);
-    format::json(UserPage {
-        results: items,
-        meta: PaginationMeta {
-            page,
-            page_size,
-            total_pages,
-            total_items: u64::try_from(count).unwrap_or(0),
-        },
-    })
+    let page = query::paginate(
+        &ctx.db,
+        users::Entity::find().order_by_asc(UserColumn::Id),
+        None,
+        &pagination,
+    )
+    .await?;
+    let items: Vec<AdminUserResponse> = page.page.iter().map(AdminUserResponse::from).collect();
+    format::json(Pager::new(items, page.meta))
 }
 
 /// Creates an account with a temporary password the person must change at first sign-in.
@@ -191,13 +138,12 @@ pub async fn create(
     Json(params): Json<CreateUserParams>,
 ) -> Result<Response> {
     auth.require("users:manage")?;
-    let db = Database::from_context(&ctx)?;
     let Some(role) = Role::parse(&params.role) else {
         return bad_request("Unknown role.");
     };
     let password = temporary_password();
     let user = users::Model::create_with_password(
-        &db,
+        &ctx.db,
         &NewUser {
             email: params.email,
             name: params.name,
@@ -208,7 +154,7 @@ pub async fn create(
     )
     .await
     .map_err(|e| match e {
-        ModelError::EntityAlreadyExists => Error::CustomError(
+        ModelError::EntityAlreadyExists {} => Error::CustomError(
             axum::http::StatusCode::CONFLICT,
             loco_rs::controller::ErrorDetail::new("conflict", "That email is already in use."),
         ),
@@ -216,7 +162,7 @@ pub async fn create(
         other => other.into(),
     })?;
     audit::record(
-        &db,
+        &ctx.db,
         Some(&auth.user),
         &meta,
         Entry::new("user.created")
@@ -239,7 +185,6 @@ pub async fn change_status(
     action: &str,
 ) -> Result<Response> {
     auth.require("users:manage")?;
-    let db = Database::from_context(ctx)?;
     let user = find(ctx, pid).await?;
     if status != "active" {
         if user.id == auth.user.id {
@@ -247,12 +192,12 @@ pub async fn change_status(
         }
         ensure_other_hr_admin(ctx, &user).await?;
     }
-    let updated = user.set_status(&db, status).await?;
+    let updated = user.into_active_model().set_status(&ctx.db, status).await?;
     if status != "active" {
-        refresh_tokens::Model::revoke_all_for_user(&db, updated.id).await?;
+        refresh_tokens::Model::revoke_all_for_user(&ctx.db, updated.id).await?;
     }
     audit::record(
-        &db,
+        &ctx.db,
         Some(&auth.user),
         meta,
         Entry::new(action).target("user", updated.pid),
@@ -302,7 +247,6 @@ pub async fn set_role(
     Json(params): Json<SetRoleParams>,
 ) -> Result<Response> {
     auth.require("users:manage")?;
-    let db = Database::from_context(&ctx)?;
     let Some(role) = Role::parse(&params.role) else {
         return bad_request("Unknown role.");
     };
@@ -311,10 +255,12 @@ pub async fn set_role(
         ensure_other_hr_admin(&ctx, &user).await?;
     }
     let old = user.role.clone();
-    let updated = user.set_role(&db, role.as_str()).await?;
+    let mut active = user.into_active_model();
+    active.role = ActiveValue::set(role.as_str().to_owned());
+    let updated = active.update(&ctx.db).await?;
     // The new role applies from the next request; old sessions keep working but get new rights.
     audit::record(
-        &db,
+        &ctx.db,
         Some(&auth.user),
         &meta,
         Entry::new("user.role_changed")
@@ -337,13 +283,15 @@ pub async fn reset_password(
     Path(pid): Path<String>,
 ) -> Result<Response> {
     auth.require("users:manage")?;
-    let db = Database::from_context(&ctx)?;
     let user = find(&ctx, &pid).await?;
     let password = temporary_password();
-    let updated = user.set_password(&db, &password, true).await?;
-    refresh_tokens::Model::revoke_all_for_user(&db, updated.id).await?;
+    let updated = user
+        .into_active_model()
+        .set_password(&ctx.db, &password, true)
+        .await?;
+    refresh_tokens::Model::revoke_all_for_user(&ctx.db, updated.id).await?;
     audit::record(
-        &db,
+        &ctx.db,
         Some(&auth.user),
         &meta,
         Entry::new("user.password_reset_by_admin").target("user", updated.pid),

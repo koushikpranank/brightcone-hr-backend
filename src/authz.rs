@@ -14,7 +14,7 @@ use loco_rs::{
 };
 use serde::Serialize;
 
-use crate::{database::Database, models::users};
+use crate::models::users;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,19 +23,10 @@ pub enum Role {
     Manager,
     Finance,
     HrAdmin,
-    Recruiter,
-    PayrollAdmin,
 }
 
 impl Role {
-    pub const ALL: [Self; 6] = [
-        Self::Employee,
-        Self::Manager,
-        Self::Finance,
-        Self::HrAdmin,
-        Self::Recruiter,
-        Self::PayrollAdmin,
-    ];
+    pub const ALL: [Self; 4] = [Self::Employee, Self::Manager, Self::Finance, Self::HrAdmin];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -44,8 +35,6 @@ impl Role {
             Self::Manager => "manager",
             Self::Finance => "finance",
             Self::HrAdmin => "hr_admin",
-            Self::Recruiter => "recruiter",
-            Self::PayrollAdmin => "payroll_admin",
         }
     }
 
@@ -85,20 +74,13 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     "files:read",
     "users:manage",
     "audit:read",
-    "records:read",
-    "records:manage",
-    "backup:manage",
-    "rules:manage",
-    "recruitment:manage",
-    "payroll:read",
-    "payroll:manage",
 ];
 
 /// The role → permission table. Add a line here when a ticket adds a permission.
 #[must_use]
 pub const fn scope_for(role: Role, permission: &str) -> Option<Scope> {
     // `match` on strings is not const-friendly everywhere, so compare bytes by hand.
-    use Role::{Employee, Finance, HrAdmin, Manager, PayrollAdmin, Recruiter};
+    use Role::{Employee, Finance, HrAdmin, Manager};
     let p = permission.as_bytes();
     if eq(p, b"profile:read") || eq(p, b"approvals:submit") || eq(p, b"files:upload") {
         return Some(Scope::Own);
@@ -107,48 +89,19 @@ pub const fn scope_for(role: Role, permission: &str) -> Option<Scope> {
         return match role {
             Employee => None,
             Manager => Some(Scope::Team),
-            Finance | HrAdmin | PayrollAdmin => Some(Scope::All),
-            Recruiter => None,
+            Finance | HrAdmin => Some(Scope::All),
         };
     }
     if eq(p, b"files:read") {
         return match role {
-            HrAdmin | PayrollAdmin => Some(Scope::All),
-            Employee | Manager | Finance | Recruiter => Some(Scope::Own),
+            HrAdmin => Some(Scope::All),
+            Employee | Manager | Finance => Some(Scope::Own),
         };
     }
     if eq(p, b"users:manage") || eq(p, b"audit:read") {
         return match role {
             HrAdmin => Some(Scope::All),
-            Employee | Manager | Finance | Recruiter | PayrollAdmin => None,
-        };
-    }
-    if eq(p, b"records:read")
-        || eq(p, b"records:manage")
-        || eq(p, b"backup:manage")
-        || eq(p, b"rules:manage")
-    {
-        return match role {
-            HrAdmin => Some(Scope::All),
-            _ => None,
-        };
-    }
-    if eq(p, b"recruitment:manage") {
-        return match role {
-            HrAdmin | Recruiter => Some(Scope::All),
-            _ => None,
-        };
-    }
-    if eq(p, b"payroll:read") {
-        return match role {
-            HrAdmin | Finance | PayrollAdmin => Some(Scope::All),
-            _ => None,
-        };
-    }
-    if eq(p, b"payroll:manage") {
-        return match role {
-            HrAdmin | PayrollAdmin => Some(Scope::All),
-            _ => None,
+            Employee | Manager | Finance => None,
         };
     }
     None
@@ -216,8 +169,7 @@ impl FromRequestParts<AppContext> for AuthUser {
     ) -> std::result::Result<Self, Self::Rejection> {
         let jwt = extract_jwt_from_request_parts(parts, ctx)?;
         let unauthorized = || Error::Unauthorized("Please sign in.".to_owned());
-        let db = Database::from_context(ctx)?;
-        let user = users::Model::find_by_pid(&db, &jwt.claims.pid)
+        let user = users::Model::find_by_pid(&ctx.db, &jwt.claims.pid)
             .await
             .map_err(|_| unauthorized())?;
         if user.status != "active" {
@@ -264,21 +216,5 @@ mod tests {
                 "{p} has no owner"
             );
         }
-    }
-
-    #[test]
-    fn six_role_matrix_keeps_sensitive_areas_separate() {
-        assert_eq!(Role::ALL.len(), 6);
-        assert_eq!(
-            scope_for(Role::Recruiter, "recruitment:manage"),
-            Some(Scope::All)
-        );
-        assert_eq!(scope_for(Role::Recruiter, "payroll:manage"), None);
-        assert_eq!(
-            scope_for(Role::PayrollAdmin, "payroll:manage"),
-            Some(Scope::All)
-        );
-        assert_eq!(scope_for(Role::PayrollAdmin, "users:manage"), None);
-        assert_eq!(scope_for(Role::HrAdmin, "rules:manage"), Some(Scope::All));
     }
 }

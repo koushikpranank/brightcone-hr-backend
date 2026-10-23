@@ -1,7 +1,6 @@
 use brightcone_hr_backend::{
     app::App,
     authz::Role,
-    database::Database,
     models::users::{self, check_password_strength, normalize_email, NewUser},
 };
 use loco_rs::testing::prelude::*;
@@ -38,8 +37,7 @@ fn password_rules() {
 #[serial]
 async fn passwords_are_stored_hashed_and_roles_default_safely() {
     let boot = boot_test::<App>().await.unwrap();
-    let db = Database::from_context(&boot.app_context).unwrap();
-    let user = users::Model::create_with_password(&db, &new_user("a@x.ai"))
+    let user = users::Model::create_with_password(&boot.app_context.db, &new_user("a@x.ai"))
         .await
         .unwrap();
     assert!(user.password.starts_with("$argon2"));
@@ -53,11 +51,11 @@ async fn passwords_are_stored_hashed_and_roles_default_safely() {
 #[serial]
 async fn the_same_email_in_another_case_is_a_duplicate() {
     let boot = boot_test::<App>().await.unwrap();
-    let db = Database::from_context(&boot.app_context).unwrap();
-    users::Model::create_with_password(&db, &new_user("Dup@x.ai"))
+    let db = &boot.app_context.db;
+    users::Model::create_with_password(db, &new_user("Dup@x.ai"))
         .await
         .unwrap();
-    let again = users::Model::create_with_password(&db, &new_user("dup@X.AI")).await;
+    let again = users::Model::create_with_password(db, &new_user("dup@X.AI")).await;
     assert!(again.is_err());
 }
 
@@ -65,15 +63,15 @@ async fn the_same_email_in_another_case_is_a_duplicate() {
 #[serial]
 async fn an_invalid_email_or_name_is_rejected() {
     let boot = boot_test::<App>().await.unwrap();
-    let db = Database::from_context(&boot.app_context).unwrap();
+    let db = &boot.app_context.db;
     assert!(
-        users::Model::create_with_password(&db, &new_user("not-an-email"))
+        users::Model::create_with_password(db, &new_user("not-an-email"))
             .await
             .is_err()
     );
     let mut short = new_user("b@x.ai");
     short.name = "A".to_owned();
-    assert!(users::Model::create_with_password(&db, &short)
+    assert!(users::Model::create_with_password(db, &short)
         .await
         .is_err());
 }

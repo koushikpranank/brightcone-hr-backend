@@ -11,8 +11,8 @@
 3. Records that are not yours return `404`, not `403`.
 4. Money is an integer in paise. Never a float.
 5. Passwords, tokens and salary figures never go into logs.
-6. Use Diesel with parameterized SQL. Never concatenate user input into SQL.
-7. The app runs as `app_runtime` for queries and uses `app_schema_sync` only for additive startup DDL. Keep these production credentials separate.
+6. Use SeaORM queries. Never build SQL by joining strings.
+7. The app runs as `app_runtime` and cannot change table structure. Migrations run as `app_migrator`.
 8. `audit_logs` is append-only.
 9. Secrets come from environment variables, never from Git.
 10. Generate, then edit: `cargo loco generate ...` writes the file and the wiring.
@@ -23,4 +23,4 @@
 3. Copy `openapi.json` into the frontend repo and run `npm run gen:api` there.
 
 ## Commands
-`make db-up` · `make run` · `make test` · `make lint` · `make openapi`
+`make db-up` · `make migrate` · `make run` · `make test` · `make lint` · `make openapi`

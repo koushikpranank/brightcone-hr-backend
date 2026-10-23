@@ -37,6 +37,7 @@ ts-rs = { version = "12", features = ["chrono-impl", "serde-compat"] }
 include_dir = { version = "0.7" }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 sha2 = "0.10"
+ring = "0.17.14"
 governor = "0.10"
 tower-http = { version = "0.7", features = [
     "cors",

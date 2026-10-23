@@ -1,25 +1,21 @@
-use chrono::{DateTime, Duration, Utc};
-use diesel::{
-    prelude::QueryableByName,
-    sql_query,
-    sql_types::{BigInt, Bool, Nullable, Text, Timestamptz, Uuid as SqlUuid},
-    OptionalExtension,
-};
-use diesel_async::{AsyncConnection, RunQueryDsl};
-use loco_rs::hash;
+//! Refresh tokens (ticket P1-05). The browser holds a random secret in an `HttpOnly` cookie; the
+//! database holds only its SHA-256 hash. Every use swaps it for a new one ("rotation"). Presenting a
+//! token that was already used means it leaked, so the whole chain (the "family") is revoked.
+use chrono::{DateTime, Duration, FixedOffset, Local};
+use loco_rs::{hash, prelude::*};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{
-    database::Database,
-    models::error::{ModelError, ModelResult},
-    settings::AppSettings,
-};
+pub use super::_entities::refresh_tokens::{self, ActiveModel, Entity, Model};
+use crate::settings::AppSettings;
 
+impl ActiveModelBehavior for ActiveModel {}
+
+/// A freshly created token. `secret` is the only copy of the value and is never stored.
 #[derive(Debug)]
 pub struct Issued {
     pub secret: String,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: DateTime<FixedOffset>,
     pub persistent: bool,
     pub user_id: i64,
 }
@@ -27,36 +23,33 @@ pub struct Issued {
 #[derive(Debug)]
 pub enum Rotation {
     Rotated(Issued),
-    Reused { user_id: i64 },
+    /// A used or revoked token came back. The family has been revoked.
+    Reused {
+        user_id: i64,
+    },
     Invalid,
 }
-
-#[derive(QueryableByName)]
-struct TokenRow {
-    #[diesel(sql_type = BigInt)]
-    user_id: i64,
-    #[diesel(sql_type = SqlUuid)]
-    family_id: Uuid,
-    #[diesel(sql_type = Bool)]
-    persistent: bool,
-    #[diesel(sql_type = Timestamptz)]
-    expires_at: DateTime<Utc>,
-    #[diesel(sql_type = Nullable<Timestamptz>)]
-    used_at: Option<DateTime<Utc>>,
-    #[diesel(sql_type = Nullable<Timestamptz>)]
-    revoked_at: Option<DateTime<Utc>>,
-}
-
-pub struct Model;
 
 #[must_use]
 pub fn hash_token(secret: &str) -> String {
     format!("{:x}", Sha256::digest(secret.as_bytes()))
 }
 
+fn ttl(settings: &AppSettings, persistent: bool) -> Duration {
+    if persistent {
+        Duration::days(settings.refresh_ttl_days)
+    } else {
+        Duration::hours(settings.session_ttl_hours)
+    }
+}
+
 impl Model {
-    pub async fn issue(
-        db: &Database,
+    /// Creates a token. Pass the `family` of the token being replaced when rotating.
+    ///
+    /// # Errors
+    /// Database errors.
+    pub async fn issue<C: ConnectionTrait>(
+        db: &C,
         settings: &AppSettings,
         user_id: i64,
         family: Option<Uuid>,
@@ -64,23 +57,18 @@ impl Model {
         ip: Option<String>,
     ) -> ModelResult<Issued> {
         let secret = hash::random_string(64);
-        let token_hash = hash_token(&secret);
-        let family_id = family.unwrap_or_else(Uuid::new_v4);
-        let expires_at = expiry(settings, persistent);
-        let mut conn = db.get().await.map_err(db_error)?;
-        sql_query(
-            "INSERT INTO refresh_tokens (user_id, token_hash, family_id, persistent, expires_at, created_ip) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind::<BigInt, _>(user_id)
-        .bind::<Text, _>(token_hash)
-        .bind::<SqlUuid, _>(family_id)
-        .bind::<Bool, _>(persistent)
-        .bind::<Timestamptz, _>(expires_at)
-        .bind::<Nullable<Text>, _>(ip)
-        .execute(&mut *conn)
-        .await
-        .map_err(ModelError::from)?;
+        let expires_at: DateTime<FixedOffset> = (Local::now() + ttl(settings, persistent)).into();
+        ActiveModel {
+            user_id: ActiveValue::set(user_id),
+            token_hash: ActiveValue::set(hash_token(&secret)),
+            family_id: ActiveValue::set(family.unwrap_or_else(Uuid::new_v4)),
+            persistent: ActiveValue::set(persistent),
+            expires_at: ActiveValue::set(expires_at),
+            created_ip: ActiveValue::set(ip),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
         Ok(Issued {
             secret,
             expires_at,
@@ -89,133 +77,110 @@ impl Model {
         })
     }
 
+    /// Swaps a presented token for a new one, atomically.
+    ///
+    /// # Errors
+    /// Database errors.
     pub async fn rotate(
-        db: &Database,
+        db: &DatabaseConnection,
         settings: &AppSettings,
         presented: &str,
         ip: Option<String>,
     ) -> ModelResult<Rotation> {
-        let presented_hash = hash_token(presented);
-        let next_secret = hash::random_string(64);
-        let next_hash = hash_token(&next_secret);
-        let ip = ip.clone();
-        let mut conn = db.get().await.map_err(db_error)?;
-        conn.transaction::<_, diesel::result::Error, _>(async |conn| {
-            let found = sql_query(
-                "SELECT user_id, family_id, persistent, expires_at, used_at, revoked_at \
-                 FROM refresh_tokens WHERE token_hash = $1 FOR UPDATE",
-            )
-            .bind::<Text, _>(presented_hash.clone())
-            .get_result::<TokenRow>(conn)
-            .await
-            .optional()?;
-            let Some(row) = found else { return Ok(Rotation::Invalid) };
-
-            if row.used_at.is_some() || row.revoked_at.is_some() {
-                sql_query("UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL")
-                    .bind::<SqlUuid, _>(row.family_id)
-                    .execute(conn)
-                    .await?;
-                return Ok(Rotation::Reused { user_id: row.user_id });
-            }
-            if row.expires_at < Utc::now() {
-                return Ok(Rotation::Invalid);
-            }
-
-            sql_query("UPDATE refresh_tokens SET used_at = now() WHERE token_hash = $1")
-                .bind::<Text, _>(presented_hash)
-                .execute(conn)
-                .await?;
-            let expires_at = expiry(settings, row.persistent);
-            sql_query(
-                "INSERT INTO refresh_tokens (user_id, token_hash, family_id, persistent, expires_at, created_ip) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
-            )
-            .bind::<BigInt, _>(row.user_id)
-            .bind::<Text, _>(next_hash)
-            .bind::<SqlUuid, _>(row.family_id)
-            .bind::<Bool, _>(row.persistent)
-            .bind::<Timestamptz, _>(expires_at)
-            .bind::<Nullable<Text>, _>(ip)
-            .execute(conn)
+        let txn = db.begin().await?;
+        let found = Entity::find()
+            .filter(refresh_tokens::Column::TokenHash.eq(hash_token(presented)))
+            .lock_exclusive()
+            .one(&txn)
             .await?;
-            Ok(Rotation::Rotated(Issued {
-                secret: next_secret,
-                expires_at,
-                persistent: row.persistent,
+        let Some(row) = found else {
+            return Ok(Rotation::Invalid);
+        };
+
+        if row.used_at.is_some() || row.revoked_at.is_some() {
+            Self::revoke_family(&txn, row.family_id).await?;
+            txn.commit().await?;
+            return Ok(Rotation::Reused {
                 user_id: row.user_id,
-            }))
-        })
-        .await
-        .map_err(ModelError::from)
+            });
+        }
+        if row.expires_at < Local::now() {
+            return Ok(Rotation::Invalid);
+        }
+
+        let (user_id, family, persistent) = (row.user_id, row.family_id, row.persistent);
+        let mut used = row.into_active_model();
+        used.used_at = ActiveValue::set(Some(Local::now().into()));
+        used.update(&txn).await?;
+
+        let issued = Self::issue(&txn, settings, user_id, Some(family), persistent, ip).await?;
+        txn.commit().await?;
+        Ok(Rotation::Rotated(issued))
     }
 
-    pub async fn revoke_by_secret(db: &Database, secret: &str) -> ModelResult<Option<i64>> {
-        let mut conn = db.get().await.map_err(db_error)?;
-        let row = sql_query(
-            "SELECT user_id, family_id, persistent, expires_at, used_at, revoked_at \
-             FROM refresh_tokens WHERE token_hash = $1 LIMIT 1",
-        )
-        .bind::<Text, _>(hash_token(secret))
-        .get_result::<TokenRow>(&mut *conn)
-        .await
-        .optional()
-        .map_err(ModelError::from)?;
-        if let Some(row) = row {
-            Self::revoke_family(db, row.family_id).await?;
-            Ok(Some(row.user_id))
-        } else {
-            Ok(None)
+    /// Revokes the chain a token belongs to. Returns the user it belonged to, if the token is known.
+    ///
+    /// # Errors
+    /// Database errors.
+    pub async fn revoke_by_secret(
+        db: &DatabaseConnection,
+        secret: &str,
+    ) -> ModelResult<Option<i64>> {
+        let found = Entity::find()
+            .filter(refresh_tokens::Column::TokenHash.eq(hash_token(secret)))
+            .one(db)
+            .await?;
+        match found {
+            Some(row) => {
+                Self::revoke_family(db, row.family_id).await?;
+                Ok(Some(row.user_id))
+            }
+            None => Ok(None),
         }
     }
 
-    pub async fn revoke_family(db: &Database, family: Uuid) -> ModelResult<()> {
-        update_tokens(db, family).await
-    }
-
-    pub async fn revoke_all_for_user(db: &Database, user_id: i64) -> ModelResult<()> {
-        let mut conn = db.get().await.map_err(db_error)?;
-        sql_query("UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL")
-            .bind::<BigInt, _>(user_id)
-            .execute(&mut *conn)
-            .await
-            .map_err(ModelError::from)?;
+    /// # Errors
+    /// Database errors.
+    pub async fn revoke_family<C: ConnectionTrait>(db: &C, family: Uuid) -> ModelResult<()> {
+        Entity::update_many()
+            .col_expr(
+                refresh_tokens::Column::RevokedAt,
+                Expr::current_timestamp().into(),
+            )
+            .filter(refresh_tokens::Column::FamilyId.eq(family))
+            .filter(refresh_tokens::Column::RevokedAt.is_null())
+            .exec(db)
+            .await?;
         Ok(())
     }
 
-    pub async fn delete_expired(db: &Database) -> ModelResult<u64> {
-        let cutoff = Utc::now() - Duration::days(1);
-        let mut conn = db.get().await.map_err(db_error)?;
-        let count = sql_query("DELETE FROM refresh_tokens WHERE expires_at < $1")
-            .bind::<Timestamptz, _>(cutoff)
-            .execute(&mut *conn)
-            .await
-            .map_err(ModelError::from)?;
-        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    /// Signs the user out everywhere (password change, disable, lock).
+    ///
+    /// # Errors
+    /// Database errors.
+    pub async fn revoke_all_for_user<C: ConnectionTrait>(db: &C, user_id: i64) -> ModelResult<()> {
+        Entity::update_many()
+            .col_expr(
+                refresh_tokens::Column::RevokedAt,
+                Expr::current_timestamp().into(),
+            )
+            .filter(refresh_tokens::Column::UserId.eq(user_id))
+            .filter(refresh_tokens::Column::RevokedAt.is_null())
+            .exec(db)
+            .await?;
+        Ok(())
     }
-}
 
-async fn update_tokens(db: &Database, family: Uuid) -> ModelResult<()> {
-    let mut conn = db.get().await.map_err(db_error)?;
-    sql_query(
-        "UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL",
-    )
-    .bind::<SqlUuid, _>(family)
-    .execute(&mut *conn)
-    .await
-    .map_err(ModelError::from)?;
-    Ok(())
-}
-
-fn expiry(settings: &AppSettings, persistent: bool) -> DateTime<Utc> {
-    let ttl = if persistent {
-        Duration::days(settings.refresh_ttl_days)
-    } else {
-        Duration::hours(settings.session_ttl_hours)
-    };
-    Utc::now() + ttl
-}
-
-fn db_error(error: loco_rs::Error) -> ModelError {
-    ModelError::Database(error.to_string())
+    /// Housekeeping: removes tokens that expired more than a day ago.
+    ///
+    /// # Errors
+    /// Database errors.
+    pub async fn delete_expired(db: &DatabaseConnection) -> ModelResult<u64> {
+        let cutoff: DateTime<FixedOffset> = (Local::now() - Duration::days(1)).into();
+        let res = Entity::delete_many()
+            .filter(refresh_tokens::Column::ExpiresAt.lt(cutoff))
+            .exec(db)
+            .await?;
+        Ok(res.rows_affected)
+    }
 }

@@ -7,19 +7,11 @@ use brightcone_hr_backend::{
         users::{self},
     },
 };
-use diesel::{prelude::QueryableByName, sql_query, sql_types::Text};
-use diesel_async::RunQueryDsl;
 use loco_rs::testing::prelude::*;
 use serde_json::{json, Value};
 use serial_test::serial;
 
 use super::support::*;
-
-#[derive(QueryableByName)]
-struct TokenHashRow {
-    #[diesel(sql_type = Text)]
-    token_hash: String,
-}
 
 #[tokio::test]
 #[serial]
@@ -51,10 +43,8 @@ async fn login_returns_access_token_and_a_hardened_refresh_cookie() {
 
         // Only the hash is stored.
         let secret = refresh_secret(&response);
-        let db = database(&ctx);
-        let mut conn = db.get().await.unwrap();
-        let stored = sql_query("SELECT token_hash FROM refresh_tokens")
-            .load::<TokenHashRow>(&mut *conn)
+        let stored = brightcone_hr_backend::models::refresh_tokens::Entity::find()
+            .all(&ctx.db)
             .await
             .unwrap();
         assert_eq!(stored.len(), 1);
@@ -119,7 +109,7 @@ async fn five_wrong_passwords_lock_the_account_even_for_the_right_password() {
             assert_eq!(r.status_code(), 401, "attempt {attempt}");
         }
 
-        let locked = users::Model::find_by_email(&database(&ctx), "a@brightcone.ai")
+        let locked = users::Model::find_by_email(&ctx.db, "a@brightcone.ai")
             .await
             .unwrap();
         assert_eq!(locked.status, "locked");
@@ -142,7 +132,7 @@ async fn a_good_login_resets_the_failure_counter() {
             login_with(&request, "a@brightcone.ai", "wrong password here", false).await;
         }
         assert_eq!(login(&request, "a@brightcone.ai").await.status_code(), 200);
-        let user = users::Model::find_by_email(&database(&ctx), "a@brightcone.ai")
+        let user = users::Model::find_by_email(&ctx.db, "a@brightcone.ai")
             .await
             .unwrap();
         assert_eq!(user.failed_logins, 0);
@@ -156,7 +146,10 @@ async fn a_good_login_resets_the_failure_counter() {
 async fn disabled_account_cannot_sign_in() {
     request::<App, _, _>(|request, ctx| async move {
         let user = make_user(&ctx, "a@brightcone.ai", Role::Employee).await;
-        user.set_status(&database(&ctx), "disabled").await.unwrap();
+        user.into_active_model()
+            .set_status(&ctx.db, "disabled")
+            .await
+            .unwrap();
 
         let response = login(&request, "a@brightcone.ai").await;
         assert_eq!(response.status_code(), 403);
@@ -230,7 +223,10 @@ async fn refresh_is_refused_after_the_account_is_disabled() {
     request::<App, _, _>(|request, ctx| async move {
         let user = make_user(&ctx, "a@brightcone.ai", Role::Employee).await;
         let (_, secret) = sign_in(&request, "a@brightcone.ai").await;
-        user.set_status(&database(&ctx), "disabled").await.unwrap();
+        user.into_active_model()
+            .set_status(&ctx.db, "disabled")
+            .await
+            .unwrap();
 
         assert_eq!(refresh_with(&request, &secret).await.status_code(), 401);
     })
@@ -321,7 +317,7 @@ async fn reset_password_works_once_and_signs_everyone_out() {
     request::<App, _, _>(|request, ctx| async move {
         let user = make_user(&ctx, "a@brightcone.ai", Role::Employee).await;
         let (_, session) = sign_in(&request, "a@brightcone.ai").await;
-        let token = password_resets::Model::issue(&database(&ctx), user.id, 30)
+        let token = password_resets::Model::issue(&ctx.db, user.id, 30)
             .await
             .unwrap();
         let new_password = "a brand new password 42";
@@ -355,7 +351,7 @@ async fn reset_password_works_once_and_signs_everyone_out() {
 async fn reset_rejects_weak_passwords_and_unknown_tokens() {
     request::<App, _, _>(|request, ctx| async move {
         let user = make_user(&ctx, "a@brightcone.ai", Role::Employee).await;
-        let token = password_resets::Model::issue(&database(&ctx), user.id, 30)
+        let token = password_resets::Model::issue(&ctx.db, user.id, 30)
             .await
             .unwrap();
 
@@ -385,7 +381,7 @@ async fn reset_rejects_weak_passwords_and_unknown_tokens() {
 async fn an_expired_reset_link_is_refused() {
     request::<App, _, _>(|request, ctx| async move {
         let user = make_user(&ctx, "a@brightcone.ai", Role::Employee).await;
-        let token = password_resets::Model::issue(&database(&ctx), user.id, -1)
+        let token = password_resets::Model::issue(&ctx.db, user.id, -1)
             .await
             .unwrap();
         let r = request

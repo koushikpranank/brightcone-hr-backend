@@ -144,6 +144,6 @@ pub fn routes() -> Routes {
         .prefix("/api/rules")
         .add("/", get(list))
         .add("/metrics", get(metrics))
-        .add("/events/:id/retry", post(retry))
-        .add("/:rule_key", put(update))
+        .add("/events/{id}/retry", post(retry))
+        .add("/{rule_key}", put(update))
 }
