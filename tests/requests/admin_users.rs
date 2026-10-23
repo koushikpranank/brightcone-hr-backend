@@ -1,5 +1,6 @@
 use axum_test::TestServer;
 use brightcone_hr_backend::{app::App, authz::Role, models::users};
+use loco_rs::app::AppContext;
 use loco_rs::testing::prelude::*;
 use serde_json::{json, Value};
 use serial_test::serial;

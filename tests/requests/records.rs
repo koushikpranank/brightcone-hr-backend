@@ -31,15 +31,8 @@ async fn put_json(
     request.put(path).add_header(name, value).json(&body).await
 }
 
-fn employee_data(number: &str, email: &str, first: &str) -> Value {
-    json!({
-        "employee_number": number,
-        "first_name": first,
-        "last_name": "Lovelace",
-        "work_email": email,
-        "status": "active",
-        "start_date": "2026-01-01"
-    })
+fn record_data(code: &str, name: &str) -> Value {
+    json!({ "code": code, "name": name, "status": "active" })
 }
 
 #[tokio::test]
@@ -49,40 +42,95 @@ async fn record_crud_is_hr_only_and_writes_history_transactionally() {
         let token = hr_token(&request, &ctx).await;
         let employee = make_user(&ctx, "employee@brightcone.ai", Role::Employee).await;
         let employee_token = sign_in(&request, &employee.email).await.0;
-        assert_eq!(get_as(&request, "/api/record-types", &employee_token).await.status_code(), 403);
+        assert_eq!(
+            get_as(&request, "/api/record-types", &employee_token)
+                .await
+                .status_code(),
+            403
+        );
 
-        let created = post_json(&request, "/api/records/employee", &token, json!({
-            "source_id": "person-100", "data": employee_data("E-100", "ada@brightcone.ai", "Ada")
-        })).await;
+        let created = post_json(
+            &request,
+            "/api/records/custom_record",
+            &token,
+            json!({
+                "source_id": "record-100", "data": record_data("R-100", "Ada")
+            }),
+        )
+        .await;
         assert_eq!(created.status_code(), 201, "{}", created.text());
         let record: Value = created.json();
         let id = record["id"].as_str().unwrap();
-        assert_eq!(record["data"]["full_name"], "Ada Lovelace");
+        assert_eq!(record["data"]["name"], "Ada");
 
-        let duplicate = post_json(&request, "/api/records/employee", &token, json!({
-            "source_id": "person-101", "data": employee_data("E-101", "ADA@BRIGHTCONE.AI", "Augusta")
-        })).await;
+        let duplicate = post_json(
+            &request,
+            "/api/records/custom_record",
+            &token,
+            json!({
+                "source_id": "record-101", "data": record_data("R-100", "Augusta")
+            }),
+        )
+        .await;
         assert_eq!(duplicate.status_code(), 409);
 
-        let updated = put_json(&request, &format!("/api/records/{id}"), &token, json!({
-            "data": employee_data("E-100", "ada@brightcone.ai", "Grace")
-        })).await;
+        let updated = put_json(
+            &request,
+            &format!("/api/records/id/{id}"),
+            &token,
+            json!({
+                "data": record_data("R-100", "Grace")
+            }),
+        )
+        .await;
         assert_eq!(updated.status_code(), 200, "{}", updated.text());
-        assert_eq!(updated.json::<Value>()["data"]["full_name"], "Grace Lovelace");
+        assert_eq!(updated.json::<Value>()["data"]["name"], "Grace");
 
-        assert_eq!(post_json(&request, &format!("/api/records/{id}/archive"), &token, json!({})).await.status_code(), 200);
-        let active = get_as(&request, "/api/records/employee", &token).await.json::<Value>();
+        assert_eq!(
+            post_json(
+                &request,
+                &format!("/api/records/id/{id}/archive"),
+                &token,
+                json!({})
+            )
+            .await
+            .status_code(),
+            200
+        );
+        let active = get_as(&request, "/api/records/custom_record", &token)
+            .await
+            .json::<Value>();
         assert!(active["items"].as_array().unwrap().is_empty());
-        assert_eq!(post_json(&request, &format!("/api/records/{id}/restore"), &token, json!({})).await.status_code(), 200);
+        assert_eq!(
+            post_json(
+                &request,
+                &format!("/api/records/id/{id}/restore"),
+                &token,
+                json!({})
+            )
+            .await
+            .status_code(),
+            200
+        );
 
-        let history = get_as(&request, &format!("/api/records/{id}/history"), &token).await;
+        let history = get_as(&request, &format!("/api/records/id/{id}/history"), &token).await;
         assert_eq!(history.status_code(), 200);
         let history_body = history.json::<Value>();
-        let actions = history_body["items"].as_array().unwrap().iter()
-            .map(|item| item["action"].as_str().unwrap()).collect::<Vec<_>>();
+        let actions = history_body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["action"].as_str().unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(actions, ["restored", "archived", "updated", "created"]);
-        assert_eq!(get_as(&request, "/api/records/employee", &employee_token).await.status_code(), 403);
-    }).await;
+        assert_eq!(
+            get_as(&request, "/api/records/custom_record", &employee_token)
+                .await
+                .status_code(),
+            403
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -90,9 +138,15 @@ async fn record_crud_is_hr_only_and_writes_history_transactionally() {
 async fn backup_is_no_store_and_deduplicates_existing_source_records() {
     request::<App, _, _>(|request, ctx| async move {
         let token = hr_token(&request, &ctx).await;
-        post_json(&request, "/api/records/employee", &token, json!({
-            "source_id": "backup-person", "data": employee_data("E-200", "backup@brightcone.ai", "Ada")
-        })).await;
+        post_json(
+            &request,
+            "/api/records/custom_record",
+            &token,
+            json!({
+                "source_id": "backup-record", "data": record_data("R-200", "Backup fixture")
+            }),
+        )
+        .await;
         let backup = get_as(&request, "/api/backup", &token).await;
         assert_eq!(backup.status_code(), 200);
         assert_eq!(backup.headers()["cache-control"], "no-store, private");
@@ -104,5 +158,6 @@ async fn backup_is_no_store_and_deduplicates_existing_source_records() {
         assert_eq!(imported.status_code(), 200, "{}", imported.text());
         assert_eq!(imported.json::<Value>()["imported"], 0);
         assert_eq!(imported.json::<Value>()["duplicates_skipped"], 1);
-    }).await;
+    })
+    .await;
 }

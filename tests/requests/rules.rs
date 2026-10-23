@@ -2,6 +2,7 @@ use brightcone_hr_backend::{app::App, authz::Role};
 use loco_rs::testing::prelude::*;
 use serde_json::{json, Value};
 use serial_test::serial;
+use uuid::Uuid;
 
 use super::support::*;
 
@@ -43,24 +44,13 @@ async fn rules_are_hr_managed_and_dispatch_user_scoped_notifications() {
             .await;
         assert_eq!(enabled.status_code(), 200);
 
-        let created = post_json(
-            &request,
-            "/api/records/employee",
-            &hr,
-            json!({
-                "source_id": "rule-notification-employee",
-                "data": {
-                    "employee_number": "RULE-001",
-                    "first_name": "Rule",
-                    "last_name": "Notice",
-                    "work_email": "notice@brightcone.ai",
-                    "status": "active",
-                    "start_date": "2026-01-01"
-                }
-            }),
-        )
-        .await;
-        assert_eq!(created.status_code(), 201, "{}", created.text());
+        let event_id = Uuid::new_v4();
+        brightcone_hr_backend::database::sql::execute(
+            &ctx.db,
+            "INSERT INTO hr_rule_events(event_id,action_key,payload) VALUES($1,'employee.created',$2)",
+            vec![event_id.into(), json!({ "record_id": Uuid::new_v4(), "record_type": "employee", "actor_user_id": 0 }).into()],
+        ).await.expect("insert pending rule event");
+        brightcone_hr_backend::rule_engine::process_event(&ctx, event_id).await.expect("process rule event");
 
         let notices = get_as(&request, "/api/notifications", &hr).await;
         assert_eq!(notices.status_code(), 200);

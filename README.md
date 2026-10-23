@@ -1,76 +1,63 @@
-# Brightcone People: Backend
+# Brightcone People API
 
-Rust + [Loco](https://loco.rs) API with PostgreSQL for the Brightcone HR portal. The frontend lives in `brightcone-hr-frontend`.
+Rust and Loco API with PostgreSQL. The frontend is in `../brightcone-hr-frontend`.
 
-## Loco decisions (ticket P0-01)
+## Native setup
 
-| Question | Answer for this project |
-|---|---|
-| Loco version | `loco-rs 1.2` (pinned in `Cargo.toml` / `Cargo.lock`) |
-| Rust version | `1.99.0` (pinned in `rust-toolchain.toml`) |
-| Database | PostgreSQL 16, SeaORM 2 |
-| Background queue | **Postgres-backed** (`queue: kind: Postgres`), so no Redis is needed |
-| Mailer | SMTP (local: Mailpit catcher on port 1025, inbox at http://localhost:8025) |
-| Auth helpers | Loco ships a sample `auth` controller (register/login/JWT). **Ticket P1-04 to P1-07 replace it** with our own login, refresh-cookie and logout flow |
+Install Rust with rustup, PostgreSQL 16, and optionally a local SMTP catcher. Start PostgreSQL using your operating system's service manager. Create the development roles and databases from an administrative `psql` session:
 
-## Run it
-
-### Option A: you have Rust and the MSVC/C++ build tools (or you use Linux/macOS)
-```bash
-cp .env.example .env
-make db-up          # Postgres + Mailpit in Docker
-make migrate        # migrations as the app_migrator role
-make run            # http://localhost:5150
-curl http://localhost:5150/api/health
+```powershell
+Copy-Item .env.example .env
+psql -U postgres -f scripts/native-postgres-setup.sql
+cargo run --bin brightcone_hr_backend-cli -- start
 ```
 
-### Option B: no Rust install (Docker only)
+On Linux/macOS, replace `Copy-Item` with `cp .env.example .env`. Then run `psql -U postgres -f scripts/native-postgres-setup.sql` and `cargo run --bin brightcone_hr_backend-cli -- start`.
+
+On Windows, find the installed service name with `Get-Service *postgres*`, then start it with `Start-Service <service-name>`. On Linux, use `sudo systemctl start postgresql`.
+
+The API listens on `http://localhost:5150`; verify it with `curl http://localhost:5150/api/health`. Schema synchronization runs before Loco assembles the HTTP router. `DATABASE_URL` is for the restricted application account. `SCHEMA_SYNC_DATABASE_URL` is a separate schema-owner account used during startup. Never use the sample credentials outside local development.
+
+## Schema synchronization
+
+The `SchemaSyncInitializer` connects to PostgreSQL through SeaORM with `SCHEMA_SYNC_DATABASE_URL`. It takes transaction-scoped advisory lock `88421038`, inspects `information_schema`, then creates missing tables, adds compatible columns, and creates idempotent indexes from the Rust schema definitions. It never drops tables or columns. Existing mapped columns with incompatible types or nullability stop startup for DBA review. The transaction completes before Loco serves HTTP routes; PostgreSQL releases the lock on both commit and rollback.
+
+All application database access uses SeaORM. Loco's default migration runner is configured with an empty migrator so the startup synchronizer owns schema setup.
+
+## Database roles
+
+| Role | Purpose |
+| --- | --- |
+| `app_migrator` | Schema synchronization and isolated test setup |
+| `app_runtime` | Application reads and writes; no schema changes |
+| `app_queue` | Loco PostgreSQL background queue |
+
+The local PostgreSQL setup script creates `brightcone_dev` and `brightcone_test`. Tests use `TEST_DATABASE_URL` and reset that database; never point it at development or production data.
+
+## Session behavior
+
+The browser keeps the access token in memory and the server stores the rotating refresh token only as an `HttpOnly`, `SameSite=Strict` cookie. On page reload the frontend calls `/api/auth/refresh` with credentials and the CSRF header, then restores the current user. API requests retry once after a 401 if the refresh cookie is still valid. The browser signs out and calls the revocation endpoint after 15 minutes without pointer, keyboard, touch, or wheel activity.
+
+## Checks
+
 ```bash
-cp .env.example .env
-docker compose up -d --wait postgres mailpit
-docker compose --profile app run --rm -e DATABASE_URL=postgres://app_migrator:migrator_dev_pw@postgres:5432/brightcone_dev api cargo run -- db migrate
-docker compose --profile app up api
-```
-The first build takes a long time (about 20 minutes); later builds are fast because the compiled files live in a Docker volume.
-
-No `make`? Each target in the [Makefile](Makefile) is one or two plain commands.
-
-## Two database roles, on purpose
-| Role | Can do | Used by |
-|---|---|---|
-| `app_migrator` | Create and change tables | `make migrate`, tests |
-| `app_runtime` | Read and write rows only (cannot CREATE/ALTER/DROP) | the running API |
-| `app_queue` | Create objects only inside its own `queue` schema | the Postgres job queue (Loco creates its queue tables at start-up) |
-
-So a bug or an attack on the running app cannot change or drop the table structure. The roles are created by `docker/postgres-init/01-roles.sh` the first time the Postgres volume is created. To start again from scratch: `make db-reset`.
-
-## Environment variables
-See [.env.example](.env.example). Development has safe defaults; **production refuses to start without** `DATABASE_URL`, `QUEUE_URL`, `JWT_SECRET`, `HOST`, `MAILER_HOST`.
-
-Tests use `TEST_DATABASE_URL` (the `brightcone_test` database) and **wipe it**. They never read `DATABASE_URL`, so they cannot erase your dev data.
-
-## API documentation
-- Endpoints are listed in `src/openapi.rs`; the committed [openapi.json](openapi.json) is the contract.
-- In development, `GET /api/openapi.json` serves it (not mounted in production).
-- A test and CI fail when `openapi.json` is stale. Fix with `make openapi`, then copy the file to the frontend repo and run `npm run gen:api`.
-
-## Checks (same as CI)
-```bash
-make lint   # cargo fmt --check + clippy -D warnings
-make test   # needs the test database from make db-up
+cargo fmt --all -- --check
+cargo clippy --all-features -- -D warnings
+cargo test --all-features
 cargo audit && cargo deny check
 ```
 
-## Project layout
-```
-src/controllers/   thin handlers (health, docs, auth sample)
-src/models/        database models (generated by Loco)
-src/views/         JSON response types (never return raw entities)
-src/openapi.rs     API contract
-migration/         database change scripts
-config/            development / test / production yaml (secrets via env)
-docker/            Postgres init script (roles + databases)
-tests/             API and model tests
-```
+API endpoints are described in `src/openapi.rs` and `openapi.json`. In development, `GET /api/openapi.json` serves the specification. Use `make openapi` after contract changes, then regenerate frontend types with `npm run gen:api` in the frontend repository.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for branch names and rules. `AGENTS.md` and `.claude/skills/loco/` are Loco's own guides for AI coding assistants and are safe to keep.
+## Layout
+
+```text
+src/controllers/   HTTP handlers
+src/models/        Loco/SeaORM models
+src/initializers/  Loco startup initializers
+src/database/      typed schema manifest and synchronizer
+src/people/        employee and organization domain logic
+config/            environment-specific application settings
+scripts/           native PostgreSQL development setup
+tests/             API and database tests
+```

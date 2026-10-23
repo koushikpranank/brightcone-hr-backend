@@ -1,29 +1,18 @@
-use diesel::{
-    prelude::QueryableByName,
-    sql_query,
-    sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid},
-};
-use diesel_async::RunQueryDsl;
 use loco_rs::prelude::*;
+use sea_orm::FromQueryResult;
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{authz::AuthUser, database::Database};
+use crate::{authz::AuthUser, database::sql};
 
-#[derive(Debug, Serialize, ToSchema, QueryableByName)]
+#[derive(Debug, Serialize, ToSchema, FromQueryResult)]
 pub struct Notification {
-    #[diesel(sql_type = SqlUuid)]
     pub id: Uuid,
-    #[diesel(sql_type = Text)]
     pub rule_key: String,
-    #[diesel(sql_type = Text)]
     pub title: String,
-    #[diesel(sql_type = Text)]
     pub body: String,
-    #[diesel(sql_type = Text)]
     pub created_at: String,
-    #[diesel(sql_type = Nullable<Text>)]
     pub read_at: Option<String>,
 }
 
@@ -33,25 +22,31 @@ pub struct NotificationPage {
     pub unread_count: i64,
 }
 
+#[derive(FromQueryResult)]
+struct CountRow {
+    count: i64,
+}
+
 #[utoipa::path(get, path = "/api/notifications", security(("bearer" = [])), responses((status = 200, body = NotificationPage)))]
 #[debug_handler]
 pub async fn list(auth: AuthUser, State(ctx): State<AppContext>) -> Result<Response> {
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    let items = sql_query("SELECT id,rule_key,title,body,created_at::text AS created_at,read_at::text AS read_at FROM hr_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50")
-        .bind::<BigInt,_>(auth.user.id).load::<Notification>(&mut *conn).await.map_err(Database::map_error)?;
-    let unread_count = sql_query("SELECT count(*)::bigint AS count FROM hr_notifications WHERE user_id=$1 AND read_at IS NULL")
-        .bind::<BigInt,_>(auth.user.id).get_result::<CountRow>(&mut *conn).await.map_err(Database::map_error)?.count;
+    let items = sql::all::<Notification>(
+        &ctx.db,
+        "SELECT id,rule_key,title,body,created_at::text AS created_at,read_at::text AS read_at FROM hr_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50",
+        vec![auth.user.id.into()],
+    )
+    .await?;
+    let unread_count = sql::one::<CountRow>(
+        &ctx.db,
+        "SELECT count(*)::bigint AS count FROM hr_notifications WHERE user_id=$1 AND read_at IS NULL",
+        vec![auth.user.id.into()],
+    )
+    .await?
+    .count;
     format::json(NotificationPage {
         items,
         unread_count,
     })
-}
-
-#[derive(diesel::QueryableByName)]
-struct CountRow {
-    #[diesel(sql_type = BigInt)]
-    count: i64,
 }
 
 #[utoipa::path(post, path = "/api/notifications/{id}/read", security(("bearer" = [])), responses((status = 200, body = Notification)))]
@@ -61,14 +56,13 @@ pub async fn mark_read(
     State(ctx): State<AppContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Response> {
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    let notification = sql_query("UPDATE hr_notifications SET read_at=COALESCE(read_at,now()) WHERE id=$1 AND user_id=$2 RETURNING id,rule_key,title,body,created_at::text AS created_at,read_at::text AS read_at")
-        .bind::<SqlUuid,_>(id).bind::<BigInt,_>(auth.user.id)
-        .get_result::<Notification>(&mut *conn).await.map_err(|error| match error {
-            diesel::result::Error::NotFound => Error::NotFound,
-            other => Database::map_error(other),
-        })?;
+    let notification = sql::optional::<Notification>(
+        &ctx.db,
+        "UPDATE hr_notifications SET read_at=COALESCE(read_at,now()) WHERE id=$1 AND user_id=$2 RETURNING id,rule_key,title,body,created_at::text AS created_at,read_at::text AS read_at",
+        vec![id.into(), auth.user.id.into()],
+    )
+    .await?
+    .ok_or(Error::NotFound)?;
     format::json(notification)
 }
 

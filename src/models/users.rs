@@ -176,6 +176,7 @@ impl Model {
             password: ActiveValue::set(password_hash),
             name: ActiveValue::set(params.name.trim().to_owned()),
             role: ActiveValue::set(params.role.as_str().to_owned()),
+            status: ActiveValue::set("active".to_owned()),
             must_change_password: ActiveValue::set(params.must_change_password),
             ..Default::default()
         }

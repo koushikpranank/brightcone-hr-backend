@@ -16,26 +16,12 @@ jobs:
     name: Format, lint, test
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-
     env:
-      # Same two roles and databases as local development (docker/postgres-init/01-roles.sh)
       TEST_DATABASE_URL: postgres://app_migrator:migrator_dev_pw@localhost:5432/brightcone_test
+      TEST_QUEUE_URL: postgres://app_queue:queue_dev_pw@localhost:5432/brightcone_test
       DATABASE_URL: postgres://app_runtime:runtime_dev_pw@localhost:5432/brightcone_dev
+      SCHEMA_SYNC_DATABASE_URL: postgres://app_migrator:migrator_dev_pw@localhost:5432/brightcone_dev
       QUEUE_URL: postgres://app_queue:queue_dev_pw@localhost:5432/brightcone_dev
-      MIGRATION_DATABASE_URL:postgres://app_migrator:migrator_dev_pw@localhost:5432/brightcone_dev
 
     steps:
       - uses: actions/checkout@v4
@@ -47,20 +33,21 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install and start native PostgreSQL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-client-16
+          sudo systemctl start postgresql
+
       - name: Create database roles and databases
         run: |
-          export PGPASSWORD=postgres
-          MIGRATOR_PASSWORD=migrator_dev_pw RUNTIME_PASSWORD=runtime_dev_pw QUEUE_PASSWORD=queue_dev_pw \
-          POSTGRES_USER=postgres PGHOST=localhost bash docker/postgres-init/01-roles.sh
+          sudo -u postgres psql -f scripts/native-postgres-setup.sql
 
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
-
-      - name: Migrate dev database as app_migrator
-        run: DATABASE_URL="$MIGRATION_DATABASE_URL" cargo run --quiet -- db migrate
 
       - name: App starts as the restricted app_runtime role and /api/health answers
         run: |

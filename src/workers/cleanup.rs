@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use loco_rs::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{database::Database, models::refresh_tokens::Model as RefreshTokens};
+use crate::models::refresh_tokens::Model as RefreshTokens;
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 pub struct TokenCleanupArgs {}
@@ -18,8 +18,7 @@ impl BackgroundWorker<TokenCleanupArgs> for TokenCleanupWorker {
     }
 
     async fn perform(&self, _args: TokenCleanupArgs) -> Result<()> {
-        let db = Database::from_context(&self.ctx)?;
-        let deleted = RefreshTokens::delete_expired(&db).await?;
+        let deleted = RefreshTokens::delete_expired(&self.ctx.db).await?;
         tracing::info!(deleted = deleted, "purged expired refresh tokens");
         Ok(())
     }

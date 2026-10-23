@@ -92,6 +92,18 @@ mailer:
 #      - client_identifier: google # Identifier for the OAuth2 provider. Replace 'google' with your provider's name if different, must be unique within the oauth2 config.
 #        ... other fields
 
+# Test database is isolated from development and reset by SchemaSyncInitializer.
+database:
+  uri: <%= get_env(name="TEST_DATABASE_URL", default="postgres://app_runtime:runtime_dev_pw@localhost:5433/brightcone_test") %>
+  enable_logging: false
+  connect_timeout: 500
+  idle_timeout: 500
+  min_connections: 1
+  max_connections: 1
+  auto_migrate: false
+  dangerously_truncate: false
+  dangerously_recreate: false
+
 # Authentication Configuration
 auth:
   # JWT authentication

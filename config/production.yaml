@@ -7,7 +7,7 @@
 # secret or a localhost database is worse than one that refuses to boot.
 #
 # The variables this file requires:
-#   DATABASE_URL, JWT_SECRET, HOST, and the MAILER_* / REDIS_URL set below,
+#   DATABASE_URL, SCHEMA_SYNC_DATABASE_URL, JWT_SECRET, HOST, and the MAILER_* / REDIS_URL set below,
 #   depending on which features you generated.
 
 # Application logging configuration

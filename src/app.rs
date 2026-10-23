@@ -10,10 +10,9 @@ use loco_rs::{
     task::Tasks,
     Result,
 };
-use migration::Migrator;
 use std::path::Path;
 
-use crate::{controllers, models::_entities::users, tasks};
+use crate::{controllers, initializers::SchemaSyncInitializer, models::_entities::users, tasks};
 
 pub struct App;
 #[async_trait]
@@ -37,11 +36,21 @@ impl Hooks for App {
         environment: &Environment,
         config: Config,
     ) -> Result<BootResult> {
-        create_app::<Self, Migrator>(mode, environment, config).await
+        if environment == &Environment::Test {
+            let test_database = crate::database::Database::connect(true).await?;
+            test_database.close().await?;
+            let test_database_url = std::env::var("TEST_DATABASE_URL").map_err(|_| {
+                loco_rs::Error::string("TEST_DATABASE_URL is required in test environment")
+            })?;
+            crate::database::reset_test_data(&test_database_url)
+                .await
+                .map_err(|error| loco_rs::Error::string(&error))?;
+        }
+        create_app::<Self, crate::database::EmptyMigrator>(mode, environment, config).await
     }
 
     async fn initializers(_ctx: &AppContext) -> Result<Vec<Box<dyn Initializer>>> {
-        Ok(vec![])
+        Ok(vec![Box::new(SchemaSyncInitializer)])
     }
 
     fn routes(ctx: &AppContext) -> AppRoutes {
@@ -50,7 +59,19 @@ impl Hooks for App {
             .add_route(controllers::auth::routes(ctx))
             .add_route(controllers::me::routes())
             .add_route(controllers::admin_users::routes())
-            .add_route(controllers::audit_log::routes());
+            .add_route(controllers::audit_log::routes())
+            .add_route(controllers::people::routes())
+            .add_route(controllers::people_mutations::routes())
+            .add_route(controllers::people_references::routes())
+            .add_route(controllers::people_reference_mutations::routes())
+            .add_route(controllers::people_csv::routes())
+            .add_route(controllers::people_security::routes())
+            .add_route(controllers::records::routes())
+            .add_route(controllers::record_types::routes())
+            .add_route(controllers::exports::routes())
+            .add_route(controllers::files::routes())
+            .add_route(controllers::notifications::routes())
+            .add_route(controllers::rules::routes());
         // API docs are for developers, so they are not served in production.
         if ctx.environment == Environment::Production {
             routes

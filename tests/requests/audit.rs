@@ -6,7 +6,7 @@ use brightcone_hr_backend::{
     request_meta::RequestMeta,
 };
 use loco_rs::testing::prelude::*;
-use sea_orm::ConnectionTrait;
+use sea_orm::{ConnectionTrait, EntityTrait};
 use serde_json::Value;
 use serial_test::serial;
 

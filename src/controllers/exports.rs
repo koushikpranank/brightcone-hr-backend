@@ -1,59 +1,38 @@
 use std::collections::HashSet;
 
-use diesel::{
-    prelude::QueryableByName,
-    sql_query,
-    sql_types::{BigInt, Jsonb, Nullable, Text, Uuid as SqlUuid},
-};
-use diesel_async::{AsyncConnection, RunQueryDsl};
 use loco_rs::prelude::*;
+use sea_orm::FromQueryResult;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{
-    authz::AuthUser, controllers::records::Record, database::Database, models::error::ModelError,
-    records,
-};
+use crate::{authz::AuthUser, controllers::records::Record, database::sql, records};
 
 const EXPORT_LIMIT: i64 = 10_000;
 const MAX_EXPORT_DATA_BYTES: i64 = 1_000_000;
 
-#[derive(QueryableByName)]
+#[derive(FromQueryResult)]
 struct ExportStats {
-    #[diesel(sql_type = BigInt)]
     records: i64,
-    #[diesel(sql_type = BigInt)]
     history: i64,
-    #[diesel(sql_type = BigInt)]
     data_bytes: i64,
 }
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BackupDocument {
     pub format_version: u32,
     pub records: Vec<BackupRecord>,
     pub history: Vec<BackupHistory>,
 }
-
-#[derive(Debug, Serialize, Deserialize, ToSchema, QueryableByName)]
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromQueryResult)]
 pub struct BackupRecord {
-    #[diesel(sql_type = SqlUuid)]
     pub id: Uuid,
-    #[diesel(sql_type = Text)]
     pub record_type: String,
-    #[diesel(sql_type = Text)]
     pub source_id: String,
-    #[diesel(sql_type = Jsonb)]
     pub data: serde_json::Value,
-    #[diesel(sql_type = Nullable<Text>)]
     pub archived_at: Option<String>,
-    #[diesel(sql_type = BigInt)]
     pub created_by: i64,
-    #[diesel(sql_type = BigInt)]
     pub updated_by: i64,
 }
-
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BackupImport {
     pub format_version: u32,
@@ -61,27 +40,19 @@ pub struct BackupImport {
     #[serde(default)]
     pub history: Vec<BackupHistory>,
 }
-
-#[derive(Debug, Serialize, Deserialize, ToSchema, QueryableByName)]
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromQueryResult)]
 pub struct BackupHistory {
-    #[diesel(sql_type = SqlUuid)]
     pub record_id: Uuid,
-    #[diesel(sql_type = Text)]
     pub action: String,
-    #[diesel(sql_type = BigInt)]
     pub source_actor_user_id: i64,
-    #[diesel(sql_type = Nullable<Jsonb>)]
     pub before_data: Option<serde_json::Value>,
-    #[diesel(sql_type = Nullable<Jsonb>)]
     pub after_data: Option<serde_json::Value>,
-    #[diesel(sql_type = Text)]
     pub created_at: String,
 }
 
 fn require_export_access(auth: &AuthUser) -> Result<()> {
     auth.require("backup:manage").map(|_| ())
 }
-
 fn no_store(response: &mut Response) {
     response.headers_mut().insert(
         "cache-control",
@@ -92,7 +63,6 @@ fn no_store(response: &mut Response) {
         "nosniff".parse().expect("static header"),
     );
 }
-
 fn payload_too_large() -> Error {
     Error::CustomError(
         axum::http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -102,7 +72,6 @@ fn payload_too_large() -> Error {
         ),
     )
 }
-
 fn json_download(value: &impl Serialize) -> Result<Response> {
     let bytes = serde_json::to_vec(value).map_err(|_| Error::InternalServerError)?;
     if bytes.len() > 10_000_000 {
@@ -119,6 +88,7 @@ fn json_download(value: &impl Serialize) -> Result<Response> {
     no_store(&mut response);
     Ok(response)
 }
+const NON_PEOPLE: &str = "record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title')";
 
 #[utoipa::path(get, path = "/api/records/export.csv", security(("bearer" = [])), responses((status = 200, description = "CSV export")))]
 #[debug_handler]
@@ -128,17 +98,11 @@ pub async fn csv(
     Query(query): Query<super::records::ListQuery>,
 ) -> Result<Response> {
     require_export_access(&auth)?;
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    let stats = sql_query("SELECT count(*)::bigint AS records, 0::bigint AS history, COALESCE(sum(pg_column_size(data)),0)::bigint AS data_bytes FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title') AND ($1 OR archived_at IS NULL)")
-        .bind::<diesel::sql_types::Bool,_>(query.include_archived.unwrap_or(false))
-        .get_result::<ExportStats>(&mut *conn).await.map_err(Database::map_error)?;
+    let stats = sql::one::<ExportStats>(&ctx.db, &format!("SELECT count(*)::bigint AS records,0::bigint AS history,COALESCE(sum(pg_column_size(data)),0)::bigint AS data_bytes FROM hr_records WHERE {NON_PEOPLE} AND ($1 OR archived_at IS NULL)"), vec![query.include_archived.unwrap_or(false).into()]).await?;
     if stats.records > EXPORT_LIMIT || stats.data_bytes > MAX_EXPORT_DATA_BYTES {
         return Err(payload_too_large());
     }
-    let rows = sql_query("SELECT id, record_type, source_id, data, archived_at::text AS archived_at, created_at::text AS created_at, updated_at::text AS updated_at FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title') AND ($1 OR archived_at IS NULL) ORDER BY record_type, created_at DESC LIMIT $2")
-        .bind::<diesel::sql_types::Bool,_>(query.include_archived.unwrap_or(false))
-        .bind::<BigInt,_>(EXPORT_LIMIT).load::<Record>(&mut *conn).await.map_err(Database::map_error)?;
+    let rows = sql::all::<Record>(&ctx.db, &format!("SELECT id,record_type,source_id,data,archived_at::text AS archived_at,created_at::text AS created_at,updated_at::text AS updated_at FROM hr_records WHERE {NON_PEOPLE} AND ($1 OR archived_at IS NULL) ORDER BY record_type,created_at DESC LIMIT $2"), vec![query.include_archived.unwrap_or(false).into(), EXPORT_LIMIT.into()]).await?;
     let mut body =
         String::from("id,record_type,source_id,data,archived_at,created_at,updated_at\r\n");
     for row in rows {
@@ -174,7 +138,6 @@ pub async fn csv(
     no_store(&mut response);
     Ok(response)
 }
-
 fn csv_cell(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -183,20 +146,15 @@ fn csv_cell(value: &str) -> String {
 #[debug_handler]
 pub async fn backup(auth: AuthUser, State(ctx): State<AppContext>) -> Result<Response> {
     require_export_access(&auth)?;
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    let stats = sql_query("SELECT (SELECT count(*)::bigint FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title')) AS records, (SELECT count(*)::bigint FROM hr_record_history h JOIN hr_records r ON r.id=h.record_id WHERE r.record_type NOT LIKE 'employee%' AND r.record_type NOT IN ('department','grade','location','job_title')) AS history, ((SELECT COALESCE(sum(pg_column_size(data)),0) FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title')) + (SELECT COALESCE(sum(COALESCE(pg_column_size(h.before_data),0)+COALESCE(pg_column_size(h.after_data),0)),0) FROM hr_record_history h JOIN hr_records r ON r.id=h.record_id WHERE r.record_type NOT LIKE 'employee%' AND r.record_type NOT IN ('department','grade','location','job_title')))::bigint AS data_bytes")
-        .get_result::<ExportStats>(&mut *conn).await.map_err(Database::map_error)?;
+    let stats = sql::one::<ExportStats>(&ctx.db, &format!("SELECT (SELECT count(*)::bigint FROM hr_records WHERE {NON_PEOPLE}) AS records,(SELECT count(*)::bigint FROM hr_record_history h JOIN hr_records r ON r.id=h.record_id WHERE r.{NON_PEOPLE}) AS history,((SELECT COALESCE(sum(pg_column_size(data)),0) FROM hr_records WHERE {NON_PEOPLE})+(SELECT COALESCE(sum(COALESCE(pg_column_size(h.before_data),0)+COALESCE(pg_column_size(h.after_data),0)),0) FROM hr_record_history h JOIN hr_records r ON r.id=h.record_id WHERE r.{NON_PEOPLE}))::bigint AS data_bytes"), vec![]).await?;
     if stats.records > EXPORT_LIMIT
         || stats.history > 100_000
         || stats.data_bytes > MAX_EXPORT_DATA_BYTES
     {
         return Err(payload_too_large());
     }
-    let rows = sql_query("SELECT id, record_type, source_id, data, archived_at::text AS archived_at, COALESCE(created_by,0) AS created_by, COALESCE(updated_by,0) AS updated_by FROM hr_records WHERE record_type NOT LIKE 'employee%' AND record_type NOT IN ('department','grade','location','job_title') ORDER BY id LIMIT $1")
-        .bind::<BigInt,_>(EXPORT_LIMIT).load::<BackupRecord>(&mut *conn).await.map_err(Database::map_error)?;
-    let history = sql_query("SELECT h.record_id, h.action, COALESCE(h.source_actor_user_id, h.actor_user_id) AS source_actor_user_id, h.before_data, h.after_data, h.created_at::text AS created_at FROM hr_record_history h JOIN hr_records r ON r.id=h.record_id WHERE r.record_type NOT LIKE 'employee%' AND r.record_type NOT IN ('department','grade','location','job_title') ORDER BY h.id")
-        .load::<BackupHistory>(&mut *conn).await.map_err(Database::map_error)?;
+    let rows = sql::all::<BackupRecord>(&ctx.db, &format!("SELECT id,record_type,source_id,data,archived_at::text AS archived_at,COALESCE(created_by,0) AS created_by,COALESCE(updated_by,0) AS updated_by FROM hr_records WHERE {NON_PEOPLE} ORDER BY id LIMIT $1"), vec![EXPORT_LIMIT.into()]).await?;
+    let history = sql::all::<BackupHistory>(&ctx.db, &format!("SELECT h.record_id,h.action,COALESCE(h.source_actor_user_id,h.actor_user_id) AS source_actor_user_id,h.before_data,h.after_data,h.created_at::text AS created_at FROM hr_record_history h JOIN hr_records r ON r.id=h.record_id WHERE r.{NON_PEOPLE} ORDER BY h.id"), vec![]).await?;
     json_download(&BackupDocument {
         format_version: 2,
         records: rows,
@@ -213,7 +171,7 @@ pub async fn import(
 ) -> Result<Response> {
     require_export_access(&auth)?;
     if !(1..=2).contains(&backup.format_version)
-        || backup.records.len() > usize::try_from(EXPORT_LIMIT).unwrap_or(10_000)
+        || backup.records.len() > EXPORT_LIMIT as usize
         || backup.history.len() > 100_000
     {
         return Err(Error::BadRequest(
@@ -239,13 +197,13 @@ pub async fn import(
         row.data = records::validate_record(&row.record_type, &row.data)
             .map_err(|_| Error::BadRequest("Backup contains an invalid record.".to_owned()))?;
     }
-    let record_ids = backup
+    let ids = backup
         .records
         .iter()
         .map(|row| row.id)
         .collect::<HashSet<_>>();
     for item in &backup.history {
-        if !record_ids.contains(&item.record_id)
+        if !ids.contains(&item.record_id)
             || !matches!(
                 item.action.as_str(),
                 "created" | "updated" | "archived" | "restored"
@@ -264,51 +222,38 @@ pub async fn import(
             ));
         }
     }
-    let actor = auth.user.id;
     let total = backup.records.len() as i64;
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    let imported = conn.transaction::<i64, ModelError, _>(async move |conn| {
-        let mut count = 0_i64;
-        let mut inserted_records = Vec::new();
-        for row in backup.records {
-            let inserted = sql_query("INSERT INTO hr_records(id, record_type, source_id, data, archived_at, created_by, updated_by) VALUES ($1,$2,$3,$4,$5::timestamptz,$6,$6) ON CONFLICT DO NOTHING")
-                .bind::<SqlUuid,_>(row.id).bind::<Text,_>(&row.record_type).bind::<Text,_>(&row.source_id)
-                .bind::<Jsonb,_>(&row.data).bind::<Nullable<Text>,_>(row.archived_at)
-                .bind::<BigInt,_>(actor)
-                .execute(&mut *conn).await?;
-            if inserted > 0 {
-                inserted_records.push((row.id, row.data.clone()));
-                for claim in records::unique_claims(&row.record_type, &row.data) {
-                    sql_query("INSERT INTO hr_record_unique_claims(record_type,field_key,normalized_value,record_id) VALUES ($1,$2,$3,$4)")
-                        .bind::<Text,_>(&row.record_type).bind::<Text,_>(&claim.field_key).bind::<Text,_>(&claim.normalized_value)
-                        .bind::<SqlUuid,_>(row.id).execute(&mut *conn).await?;
+    let actor = auth.user.id;
+    let imported = ctx.db.transaction::<_, i64, sea_orm::DbErr>(|tx| {
+        Box::pin(async move {
+            let mut count = 0_i64; let mut inserted = Vec::new();
+            for row in backup.records {
+                let rows = sql::execute(tx, "INSERT INTO hr_records(id,record_type,source_id,data,archived_at,created_by,updated_by) VALUES($1,$2,$3,$4,$5::timestamptz,$6,$6) ON CONFLICT DO NOTHING",
+                    vec![row.id.into(), row.record_type.clone().into(), row.source_id.into(), row.data.clone().into(), row.archived_at.into(), actor.into()]).await?;
+                if rows > 0 {
+                    inserted.push((row.id, row.data.clone()));
+                    for claim in records::unique_claims(&row.record_type, &row.data) {
+                        sql::execute(tx, "INSERT INTO hr_record_unique_claims(record_type,field_key,normalized_value,record_id) VALUES($1,$2,$3,$4)", vec![row.record_type.clone().into(), claim.field_key.into(), claim.normalized_value.into(), row.id.into()]).await?;
+                    }
+                    count += 1;
                 }
-                count += 1;
             }
-        }
-        let mut history_records = HashSet::new();
-        for entry in backup.history {
-            if inserted_records.iter().any(|(id, _)| *id == entry.record_id) {
-                sql_query("INSERT INTO hr_record_history(record_id, action, actor_user_id, source_actor_user_id, before_data, after_data, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7::timestamptz)")
-                    .bind::<SqlUuid,_>(entry.record_id).bind::<Text,_>(&entry.action).bind::<BigInt,_>(actor)
-                    .bind::<BigInt,_>(entry.source_actor_user_id).bind::<Nullable<Jsonb>,_>(entry.before_data)
-                    .bind::<Nullable<Jsonb>,_>(entry.after_data).bind::<Text,_>(&entry.created_at)
-                    .execute(&mut *conn).await?;
-                history_records.insert(entry.record_id);
+            let mut history_records = HashSet::new();
+            for entry in backup.history {
+                if inserted.iter().any(|(id, _)| *id == entry.record_id) {
+                    sql::execute(tx, "INSERT INTO hr_record_history(record_id,action,actor_user_id,source_actor_user_id,before_data,after_data,created_at) VALUES($1,$2,$3,$4,$5,$6,$7::timestamptz)",
+                        vec![entry.record_id.into(), entry.action.into(), actor.into(), entry.source_actor_user_id.into(), entry.before_data.into(), entry.after_data.into(), entry.created_at.into()]).await?;
+                    history_records.insert(entry.record_id);
+                }
             }
-        }
-        for (id, data) in inserted_records {
-            if !history_records.contains(&id) {
-                sql_query("INSERT INTO hr_record_history(record_id, action, actor_user_id, after_data) VALUES ($1,'created',$2,$3)")
-                    .bind::<SqlUuid,_>(id).bind::<BigInt,_>(actor).bind::<Jsonb,_>(&data)
-                    .execute(&mut *conn).await?;
+            for (id, data) in inserted {
+                if !history_records.contains(&id) { sql::execute(tx, "INSERT INTO hr_record_history(record_id,action,actor_user_id,after_data) VALUES($1,'created',$2,$3)", vec![id.into(), actor.into(), data.into()]).await?; }
             }
-        }
-        Ok(count)
-    }).await.map_err(Error::from)?;
+            Ok(count)
+        })
+    }).await.map_err(|error| { tracing::error!(%error, "backup import transaction failed"); Error::string("Backup import failed") })?;
     let mut response = format::json(
-        serde_json::json!({"imported": imported, "duplicates_skipped": total - imported}),
+        serde_json::json!({"imported": imported, "duplicates_skipped": total-imported}),
     )?;
     no_store(&mut response);
     Ok(response)

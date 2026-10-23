@@ -8,6 +8,7 @@ use brightcone_hr_backend::{
     },
 };
 use loco_rs::testing::prelude::*;
+use sea_orm::{EntityTrait, IntoActiveModel};
 use serde_json::{json, Value};
 use serial_test::serial;
 

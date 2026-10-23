@@ -1,20 +1,17 @@
+mod empty_migrator;
 mod schema;
+pub mod sql;
 
-use diesel_async::{
-    pooled_connection::{deadpool::Pool, AsyncDieselConnectionManager},
-    AsyncPgConnection,
-};
 use loco_rs::{app::AppContext, prelude::Error};
+use sea_orm::DatabaseConnection;
 
-pub use schema::{run_autonomous_sync, Column, ColumnType, Table, TABLES};
+pub use empty_migrator::EmptyMigrator;
+pub use schema::{reset_test_data, run_autonomous_sync, Column, ColumnType, Table, TABLES};
 
-#[derive(Clone)]
-pub struct Database {
-    pool: Pool<AsyncPgConnection>,
-}
+pub struct Database;
 
 impl Database {
-    pub async fn connect(test: bool) -> loco_rs::Result<Self> {
+    pub async fn connect(test: bool) -> loco_rs::Result<DatabaseConnection> {
         let sync_url = if test {
             let url = std::env::var("TEST_DATABASE_URL")
                 .map_err(|_| Error::string("TEST_DATABASE_URL is required in test environment"))?;
@@ -28,39 +25,26 @@ impl Database {
             std::env::var("SCHEMA_SYNC_DATABASE_URL")
                 .map_err(|_| Error::string("SCHEMA_SYNC_DATABASE_URL is required"))?
         };
-        run_autonomous_sync(&sync_url)
+        let sync_database = sea_orm::Database::connect(&sync_url)
             .await
             .map_err(database_error)?;
-        if test {
-            schema::reset_test_data(&sync_url)
-                .await
-                .map_err(database_error)?;
-        }
-
+        run_autonomous_sync(&sync_database)
+            .await
+            .map_err(database_error)?;
+        sync_database.close().await.map_err(database_error)?;
         let runtime_url = if test {
             std::env::var("TEST_DATABASE_URL")
-                .map_err(|_| Error::string("TEST_DATABASE_URL is required in test environment"))?
+                .map_err(|_| Error::string("TEST_DATABASE_URL is required"))?
         } else {
             std::env::var("DATABASE_URL").map_err(|_| Error::string("DATABASE_URL is required"))?
         };
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(runtime_url);
-        let pool = Pool::builder(manager)
-            .max_size(16)
-            .build()
-            .map_err(database_error)?;
-        Ok(Self { pool })
+        sea_orm::Database::connect(runtime_url)
+            .await
+            .map_err(database_error)
     }
 
-    pub async fn get(
-        &self,
-    ) -> loco_rs::Result<impl std::ops::DerefMut<Target = AsyncPgConnection>> {
-        self.pool.get().await.map_err(database_error)
-    }
-
-    pub fn from_context(ctx: &AppContext) -> loco_rs::Result<Self> {
-        ctx.shared_store
-            .get::<Self>()
-            .ok_or_else(|| Error::string("Diesel database pool is not initialized"))
+    pub fn from_context(ctx: &AppContext) -> loco_rs::Result<DatabaseConnection> {
+        Ok(ctx.db.clone())
     }
 
     pub fn map_error(error: impl std::fmt::Display) -> Error {
@@ -77,6 +61,6 @@ fn database_name(url: &str) -> Option<&str> {
 }
 
 fn database_error(error: impl std::fmt::Display) -> Error {
-    tracing::error!(error = %error, "Diesel database operation failed");
+    tracing::error!(error = %error, "SeaORM database operation failed");
     Error::string("Database operation failed")
 }

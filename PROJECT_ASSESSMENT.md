@@ -116,16 +116,17 @@ Keep controllers thin (parse/authenticate/validate/serialize), put business rule
 
 ## Running locally
 
-Commands below assume PowerShell from the workspace root and Docker Desktop. Never use production data or production credentials in the demo seed workflow.
+Commands below assume PowerShell from the workspace root and a native PostgreSQL installation. Never use production data or production credentials in the demo seed workflow.
 
-1. Start local PostgreSQL and Mailpit:
+1. Start the local PostgreSQL service:
 
    ```powershell
    cd repos/brightcone-hr-backend
-   docker compose up -d --wait postgres mailpit
+   Get-Service *postgres*
+   Start-Service postgresql-x64-16
    ```
 
-2. Create the backend `.env` from `.env.example` and generate a unique random `JWT_SECRET` (for example, `openssl rand -base64 48`). Keep `.env` untracked. Set separate `DATABASE_URL` (runtime role), `SCHEMA_SYNC_DATABASE_URL` (DDL role), and `QUEUE_URL` values for the local Compose database. Do not reuse development credentials outside an isolated local database. For the frontend, `.env.example` documents `VITE_PROXY_TARGET=http://localhost:5150` and `VITE_API_URL=/api`; copy it to the Vite env file used by the project if overrides are needed.
+2. Create the backend `.env` from `.env.example`, run `psql -U postgres -f scripts/native-postgres-setup.sql`, and generate a unique random `JWT_SECRET` (for example, `openssl rand -base64 48`). Keep `.env` untracked. Set separate `DATABASE_URL` (runtime role), `SCHEMA_SYNC_DATABASE_URL` (DDL role), and `QUEUE_URL` values. Do not reuse development credentials outside an isolated local database. For the frontend, `.env.example` documents `VITE_PROXY_TARGET=http://localhost:5150` and `VITE_API_URL=/api`; copy it to the Vite env file used by the project if overrides are needed.
 
 3. Start the API. It syncs schema before serving requests; seed demo users only in disposable local development:
 
@@ -135,7 +136,7 @@ Commands below assume PowerShell from the workspace root and Docker Desktop. Nev
    cargo run -- task seed_demo
    ```
 
-4. The API listens on `http://localhost:5150` by default. For Docker, run `docker compose --profile app up api` instead of the host command above.
+4. The API listens on `http://localhost:5150` by default.
 
 5. In another terminal, install and run the frontend:
 
@@ -160,7 +161,7 @@ Commands below assume PowerShell from the workspace root and Docker Desktop. Nev
    cargo test --all-features
    ```
 
-Some scripts vary by the installed package manager/test runner; check `package.json`. The seed is for local-only use. Do not expose Mailpit or development Compose ports publicly.
+Some scripts vary by the installed package manager/test runner; check `package.json`. The seed is for local-only use. Do not expose a local SMTP catcher's ports publicly.
 
 ## Bugs and fixes made during this audit
 
@@ -187,7 +188,7 @@ These changes do not complete the suite backend or establish a security certific
 3. **Move rate limiting to shared infrastructure.** Process-local counters are bypassed by round-robin replicas/restarts. Use Redis or a gateway limiter with trusted client IP extraction and explicit key policies.
 4. **Harden password recovery against timing enumeration.** Queue mail uniformly and measure response-time distributions. Keep responses generic; avoid waiting for SMTP in the request path.
 5. **Remove reusable demo credentials from build/deploy pathways.** Rotate any credentials used outside disposable local data; use a secrets manager and non-public seed accounts. Secret-scan the repository and history in CI.
-6. **Production deployment and operations.** Current Compose is for local development, not a production orchestration plan. Pin container images, use a non-root minimal runtime image, TLS termination, managed PostgreSQL, encrypted backups, restore drills, schema-sync deployment ordering, readiness/liveness probes, metrics, centralized logs, alerting, and incident procedures.
+6. **Production deployment and operations.** Use a managed PostgreSQL service, a native Rust build pipeline, TLS termination, encrypted backups, restore drills, schema-sync deployment ordering, readiness/liveness probes, metrics, centralized logs, alerting, and incident procedures.
 
 ### Strongly recommended
 
@@ -203,7 +204,7 @@ These changes do not complete the suite backend or establish a security certific
 
 - Repository source, routes/OpenAPI, schema sync, configuration, docs, and frontend structure were inspected. Existing working-tree changes were preserved; repos already contained substantial uncommitted work.
 - Frontend `npm run lint`, `npm test` (2 files / 16 tests), and `npm run build` pass in this environment.
-- Backend formatting, all-target compilation, Clippy, and the 400-line source limit pass. Tests and live schema sync were not run here; Docker Desktop access was denied by the host session.
+- Prior verification status; rerun backend checks and database integration tests after applying the current schema-sync changes.
 - Playwright E2E did not complete: the default results directory was a read-only/reparse directory, and a retry with an isolated output directory stalled before producing test results. E2E verification remains open.
 - No live production environment, deployed database, SMTP provider, cloud storage, load test, external penetration test, or browser screenshot comparison was available for this assessment.
 

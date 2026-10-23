@@ -3,11 +3,11 @@
 ## Included
 
 - Remove committed JWT fallback and plaintext demo credentials from maintained docs.
-- Configure CORS from `FRONTEND_URL`, tighten API CSP, correct CI migration YAML.
+- Configure CORS from `FRONTEND_URL`, tighten API CSP, and keep CI aligned with startup schema sync.
 - Keep in-memory Files and Approvals prototypes off the API; prevent submitter self-rejection in the prototype engine.
 - Register refresh-token cleanup worker and update local developer commands.
 - Replace stale completion claims with current backend scope, API list, run steps, and production gaps.
-- Replace Loco/SeaORM domain persistence and migration CLI with Diesel async PostgreSQL and additive schema sync at startup; port API models, tasks, workers, and tests.
+- Keep schema changes in the additive startup synchronizer; port API models, tasks, workers, and tests to the typed persistence layer.
 
 ## Validation
 

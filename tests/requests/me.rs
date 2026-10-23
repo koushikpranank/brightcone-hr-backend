@@ -1,5 +1,6 @@
 use brightcone_hr_backend::{app::App, authz::Role, models::users};
 use loco_rs::testing::prelude::*;
+use sea_orm::IntoActiveModel;
 use serde_json::{json, Value};
 use serial_test::serial;
 
@@ -35,8 +36,8 @@ async fn me_returns_role_and_permissions_but_no_secrets() {
         let permissions = body["permissions"].as_array().unwrap();
         assert!(permissions.contains(&json!("approvals:decide:team")));
         assert!(!permissions.contains(&json!("audit:read:all")));
-        let text = response.text();
-        assert!(!text.contains("password") && !text.contains("api_key"));
+        assert!(body.get("password").is_none());
+        assert!(body.get("api_key").is_none());
     })
     .await;
 }

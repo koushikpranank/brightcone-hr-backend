@@ -927,7 +927,6 @@
           {
             "name": "id",
             "in": "path",
-            "description": "Employee id",
             "required": true,
             "schema": {
               "type": "string",
@@ -1421,7 +1420,7 @@
         ]
       }
     },
-    "/api/records/{id}": {
+    "/api/records/id/{id}": {
       "put": {
         "tags": [
           "records"
@@ -1456,7 +1455,7 @@
         ]
       }
     },
-    "/api/records/{id}/archive": {
+    "/api/records/id/{id}/archive": {
       "post": {
         "tags": [
           "records"
@@ -1481,7 +1480,7 @@
         ]
       }
     },
-    "/api/records/{id}/history": {
+    "/api/records/id/{id}/history": {
       "get": {
         "tags": [
           "records"
@@ -1509,7 +1508,7 @@
         ]
       }
     },
-    "/api/records/{id}/restore": {
+    "/api/records/id/{id}/restore": {
       "post": {
         "tags": [
           "records"

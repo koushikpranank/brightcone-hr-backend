@@ -7,16 +7,33 @@ pub enum ModelError {
     Other(String),
 }
 
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EntityNotFound => formatter.write_str("entity not found"),
+            Self::EntityAlreadyExists => formatter.write_str("entity already exists"),
+            Self::Validation(message) | Self::Database(message) | Self::Other(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ModelError {}
+
 pub type ModelResult<T> = std::result::Result<T, ModelError>;
 
-impl From<diesel::result::Error> for ModelError {
-    fn from(error: diesel::result::Error) -> Self {
+impl From<sea_orm::DbErr> for ModelError {
+    fn from(error: sea_orm::DbErr) -> Self {
+        let message = error.to_string();
+        if matches!(error, sea_orm::DbErr::Exec(_))
+            && (message.contains("23505")
+                || message.contains("duplicate key value violates unique constraint"))
+        {
+            return Self::EntityAlreadyExists;
+        }
         match error {
-            diesel::result::Error::NotFound => Self::EntityNotFound,
-            diesel::result::Error::DatabaseError(
-                diesel::result::DatabaseErrorKind::UniqueViolation,
-                _,
-            ) => Self::EntityAlreadyExists,
+            sea_orm::DbErr::RecordNotFound(_) => Self::EntityNotFound,
             error => Self::Database(error.to_string()),
         }
     }

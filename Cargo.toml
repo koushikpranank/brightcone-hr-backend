@@ -10,12 +10,12 @@ default-run = "brightcone_hr_backend-cli"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace.dependencies]
-loco-rs = { version = "1.2", default-features = false, features = ["auth", "cache_inmem", "cli", "worker"] }
+loco-rs = { version = "1.2", default-features = false, features = ["auth", "cache_inmem", "cli", "worker", "with-db"] }
 
 [dependencies]
 loco-rs = { workspace = true }
-diesel = { version = "2.3", features = ["chrono", "postgres", "uuid", "serde_json"] }
-diesel-async = { version = "0.9", features = ["deadpool", "postgres"] }
+sea-orm-migration = { version = "2.0", features = ["runtime-tokio-rustls", "sqlx-postgres"] }
+sea-orm = { version = "2.0", features = ["runtime-tokio-rustls", "sqlx-postgres", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 tokio = { version = "1.45", default-features = false, features = [

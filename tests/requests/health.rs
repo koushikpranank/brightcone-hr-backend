@@ -29,13 +29,10 @@ async fn health_returns_security_headers() {
             .contains("frame-ancestors 'none'"));
         assert_eq!(
             response.headers()["strict-transport-security"],
-            "max-age=31536000; includeSubDomains; preload"
+            "max-age=31536000; includeSubDomains"
         );
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert_eq!(
-            response.headers()["referrer-policy"],
-            "strict-origin-when-cross-origin"
-        );
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
     })
     .await;
 }

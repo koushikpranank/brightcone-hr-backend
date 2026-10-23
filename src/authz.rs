@@ -23,10 +23,19 @@ pub enum Role {
     Manager,
     Finance,
     HrAdmin,
+    Recruiter,
+    PayrollAdmin,
 }
 
 impl Role {
-    pub const ALL: [Self; 4] = [Self::Employee, Self::Manager, Self::Finance, Self::HrAdmin];
+    pub const ALL: [Self; 6] = [
+        Self::Employee,
+        Self::Manager,
+        Self::Finance,
+        Self::HrAdmin,
+        Self::Recruiter,
+        Self::PayrollAdmin,
+    ];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -35,6 +44,8 @@ impl Role {
             Self::Manager => "manager",
             Self::Finance => "finance",
             Self::HrAdmin => "hr_admin",
+            Self::Recruiter => "recruiter",
+            Self::PayrollAdmin => "payroll_admin",
         }
     }
 
@@ -74,13 +85,18 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     "files:read",
     "users:manage",
     "audit:read",
+    "people:manage",
+    "records:manage",
+    "records:read",
+    "backup:manage",
+    "rules:manage",
 ];
 
 /// The role → permission table. Add a line here when a ticket adds a permission.
 #[must_use]
 pub const fn scope_for(role: Role, permission: &str) -> Option<Scope> {
     // `match` on strings is not const-friendly everywhere, so compare bytes by hand.
-    use Role::{Employee, Finance, HrAdmin, Manager};
+    use Role::{Employee, Finance, HrAdmin, Manager, PayrollAdmin, Recruiter};
     let p = permission.as_bytes();
     if eq(p, b"profile:read") || eq(p, b"approvals:submit") || eq(p, b"files:upload") {
         return Some(Scope::Own);
@@ -89,19 +105,32 @@ pub const fn scope_for(role: Role, permission: &str) -> Option<Scope> {
         return match role {
             Employee => None,
             Manager => Some(Scope::Team),
-            Finance | HrAdmin => Some(Scope::All),
+            Finance | HrAdmin | PayrollAdmin => Some(Scope::All),
+            Recruiter => None,
         };
     }
     if eq(p, b"files:read") {
         return match role {
-            HrAdmin => Some(Scope::All),
+            HrAdmin | PayrollAdmin => Some(Scope::All),
             Employee | Manager | Finance => Some(Scope::Own),
+            Recruiter => None,
         };
     }
     if eq(p, b"users:manage") || eq(p, b"audit:read") {
         return match role {
             HrAdmin => Some(Scope::All),
-            Employee | Manager | Finance => None,
+            Employee | Manager | Finance | Recruiter | PayrollAdmin => None,
+        };
+    }
+    if eq(p, b"people:manage")
+        || eq(p, b"records:manage")
+        || eq(p, b"records:read")
+        || eq(p, b"backup:manage")
+        || eq(p, b"rules:manage")
+    {
+        return match role {
+            HrAdmin => Some(Scope::All),
+            Employee | Manager | Finance | Recruiter | PayrollAdmin => None,
         };
     }
     None

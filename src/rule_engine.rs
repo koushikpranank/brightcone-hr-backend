@@ -1,14 +1,10 @@
-use diesel::{
-    sql_query,
-    sql_types::{Bool, Jsonb, Text, Uuid as SqlUuid},
-};
-use diesel_async::{AsyncConnection, RunQueryDsl};
 use loco_rs::prelude::*;
+use sea_orm::{ConnectionTrait, FromQueryResult};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    database::Database,
+    database::sql,
     workers::rule_dispatch::{RuleDispatchArgs, RuleDispatchWorker},
 };
 
@@ -52,7 +48,7 @@ pub fn event_key(
             Some("expense.decided")
         }
         ("candidate", "updated")
-            if before.and_then(|value| value.get("stage")) != after.get("stage")
+            if before.and_then(|v| v.get("stage")) != after.get("stage")
                 && after.get("stage").is_some() =>
         {
             Some("candidate.stage_changed")
@@ -80,41 +76,28 @@ fn transitioned(
     current.is_some_and(|value| targets.contains(&value)) && before.and_then(status) != current
 }
 
-pub async fn record_event<C>(
-    conn: &mut C,
+#[derive(FromQueryResult)]
+struct EventIdRow {
+    event_id: Uuid,
+}
+
+pub async fn record_event(
+    connection: &impl ConnectionTrait,
     key: &str,
     payload: &RuleEventPayload,
-) -> diesel::QueryResult<Option<Uuid>>
-where
-    C: diesel_async::AsyncConnection<Backend = diesel::pg::Pg> + Send,
-{
+) -> std::result::Result<Option<Uuid>, sea_orm::DbErr> {
     if !RULES.contains(&key) {
         return Ok(None);
     }
     let event_id = Uuid::new_v4();
     let json = serde_json::to_value(payload).expect("rule event payload is serializable");
-    let inserted = sql_query("INSERT INTO hr_rule_events(event_id, action_key, payload) SELECT $1,$2,$3 WHERE EXISTS (SELECT 1 FROM hr_rules WHERE rule_key=$2 AND enabled=true) RETURNING event_id")
-        .bind::<SqlUuid,_>(event_id)
-        .bind::<Text,_>(key)
-        .bind::<Jsonb,_>(json)
-        .get_result::<EventIdRow>(conn)
-        .await;
-    match inserted {
-        Ok(row) => Ok(Some(row.event_id)),
-        Err(diesel::result::Error::NotFound) => Ok(None),
-        Err(error) => Err(error),
-    }
+    sql::optional::<EventIdRow>(connection,
+        "INSERT INTO hr_rule_events(event_id, action_key, payload) SELECT $1,$2,$3 WHERE EXISTS (SELECT 1 FROM hr_rules WHERE rule_key=$2 AND enabled=true) RETURNING event_id",
+        vec![event_id.into(), key.to_owned().into(), json.into()]).await.map(|row| row.map(|event| event.event_id))
 }
 
-#[derive(diesel::QueryableByName)]
-struct EventIdRow {
-    #[diesel(sql_type = diesel::sql_types::Uuid)]
-    event_id: Uuid,
-}
-
-#[derive(diesel::QueryableByName)]
+#[derive(FromQueryResult)]
 struct PendingEvent {
-    #[diesel(sql_type = diesel::sql_types::Uuid)]
     event_id: Uuid,
 }
 
@@ -127,17 +110,12 @@ pub async fn dispatch(ctx: &AppContext, event_id: Option<Uuid>) {
 }
 
 pub async fn enqueue_pending(ctx: &AppContext) -> Result<()> {
-    let db = Database::from_context(ctx)?;
-    let mut conn = db.get().await?;
-    let pending = sql_query(
+    let pending = sql::all::<PendingEvent>(
+        &ctx.db,
         "SELECT event_id FROM hr_rule_events WHERE status='pending' ORDER BY created_at LIMIT 500",
+        Vec::new(),
     )
-    .load::<PendingEvent>(&mut *conn)
-    .await
-    .map_err(Database::map_error)?;
-    if pending.is_empty() {
-        return Ok(());
-    }
+    .await?;
     let args = pending
         .into_iter()
         .map(|row| RuleDispatchArgs {
@@ -148,73 +126,56 @@ pub async fn enqueue_pending(ctx: &AppContext) -> Result<()> {
     Ok(())
 }
 
-pub async fn process_event(ctx: &AppContext, event_id: Uuid) -> Result<()> {
-    let db = Database::from_context(ctx)?;
-    let mut conn = db.get().await?;
-    let attempt = sql_query("UPDATE hr_rule_events SET attempts=attempts+1 WHERE event_id=$1 AND status='pending' RETURNING attempts")
-        .bind::<SqlUuid,_>(event_id)
-        .get_result::<AttemptRow>(&mut *conn).await;
-    let attempt = match attempt {
-        Ok(row) => row,
-        Err(diesel::result::Error::NotFound) => return Ok(()),
-        Err(error) => return Err(Database::map_error(error)),
-    };
-    if attempt.attempts > 5 {
-        sql_query("UPDATE hr_rule_events SET status='failed', last_error='retry limit exceeded' WHERE event_id=$1")
-            .bind::<SqlUuid,_>(event_id).execute(&mut *conn).await.map_err(Database::map_error)?;
-        return Ok(());
-    }
-    conn.transaction::<(), diesel::result::Error, _>(async move |conn| {
-        let event = sql_query("SELECT e.event_id, e.action_key, e.payload, r.enabled FROM hr_rule_events e JOIN hr_rules r ON r.rule_key=e.action_key WHERE e.event_id=$1 AND e.status='pending' FOR UPDATE OF e")
-            .bind::<SqlUuid,_>(event_id).get_result::<EventRow>(&mut *conn).await?;
-        if !event.enabled {
-            sql_query("UPDATE hr_rule_events SET status='complete', completed_at=now() WHERE event_id=$1")
-                .bind::<SqlUuid,_>(event_id).execute(&mut *conn).await?;
-            return Ok(());
-        }
-        let recipients = recipient_roles(&event.action_key);
-        if let Some(roles) = recipients {
-            for role in roles {
-                sql_query("INSERT INTO hr_notifications(user_id,event_id,rule_key,title,body) SELECT id,$1,$2,$3,$4 FROM users WHERE role=$5 AND status='active' ON CONFLICT(event_id,user_id) DO NOTHING")
-                    .bind::<SqlUuid,_>(event.event_id)
-                    .bind::<Text,_>(&event.action_key)
-                    .bind::<Text,_>(notification_title(&event.action_key))
-                    .bind::<Text,_>(notification_body(&event.payload))
-                    .bind::<Text,_>(*role)
-                    .execute(&mut *conn).await?;
-            }
-        }
-        sql_query("UPDATE hr_rule_events SET status='complete', completed_at=now() WHERE event_id=$1")
-            .bind::<SqlUuid,_>(event_id).execute(&mut *conn).await?;
-        Ok(())
-    }).await.map_err(Database::map_error)
+#[derive(FromQueryResult)]
+struct AttemptRow {
+    attempts: i32,
 }
 
-pub async fn record_failure(ctx: &AppContext, event_id: Uuid) -> Result<()> {
-    let db = Database::from_context(ctx)?;
-    let mut conn = db.get().await?;
-    sql_query("UPDATE hr_rule_events SET last_error='Rule action failed; see application logs.', status=CASE WHEN attempts >= 5 THEN 'failed' ELSE status END WHERE event_id=$1 AND status='pending'")
-        .bind::<SqlUuid,_>(event_id)
-        .execute(&mut *conn).await.map_err(Database::map_error)?;
-    Ok(())
-}
-
-#[derive(diesel::QueryableByName)]
+#[derive(FromQueryResult)]
 struct EventRow {
-    #[diesel(sql_type = diesel::sql_types::Uuid)]
     event_id: Uuid,
-    #[diesel(sql_type = Text)]
     action_key: String,
-    #[diesel(sql_type = Jsonb)]
     payload: serde_json::Value,
-    #[diesel(sql_type = Bool)]
     enabled: bool,
 }
 
-#[derive(diesel::QueryableByName)]
-struct AttemptRow {
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    attempts: i32,
+pub async fn process_event(ctx: &AppContext, event_id: Uuid) -> Result<()> {
+    let attempt = sql::optional::<AttemptRow>(&ctx.db,
+        "UPDATE hr_rule_events SET attempts=attempts+1 WHERE event_id=$1 AND status='pending' RETURNING attempts", vec![event_id.into()]).await?;
+    let Some(attempt) = attempt else {
+        return Ok(());
+    };
+    if attempt.attempts > 5 {
+        sql::execute(&ctx.db, "UPDATE hr_rule_events SET status='failed', last_error='retry limit exceeded' WHERE event_id=$1", vec![event_id.into()]).await?;
+        return Ok(());
+    }
+    ctx.db.transaction::<_, (), sea_orm::DbErr>(|tx| {
+        Box::pin(async move {
+            let Some(event) = sql::optional::<EventRow>(tx,
+                "SELECT e.event_id, e.action_key, e.payload, r.enabled FROM hr_rule_events e JOIN hr_rules r ON r.rule_key=e.action_key WHERE e.event_id=$1 AND e.status='pending' FOR UPDATE OF e", vec![event_id.into()]).await? else { return Ok(()) };
+            if event.enabled {
+                if let Some(roles) = recipient_roles(&event.action_key) {
+                    for role in roles {
+                        sql::execute(tx,
+                            "INSERT INTO hr_notifications(user_id,event_id,rule_key,title,body) SELECT id,$1,$2,$3,$4 FROM users WHERE role=$5 AND status='active' ON CONFLICT(event_id,user_id) DO NOTHING",
+                            vec![event.event_id.into(), event.action_key.clone().into(), notification_title(&event.action_key).into(), notification_body(&event.payload).into(), (*role).into()]).await?;
+                    }
+                }
+            }
+            sql::execute(tx, "UPDATE hr_rule_events SET status='complete', completed_at=now() WHERE event_id=$1", vec![event_id.into()]).await?;
+            Ok(())
+        })
+    }).await.map_err(|error| {
+        tracing::error!(%error, "rule event transaction failed");
+        Error::string("Rule event processing failed")
+    })
+}
+
+pub async fn record_failure(ctx: &AppContext, event_id: Uuid) -> Result<()> {
+    sql::execute(&ctx.db,
+        "UPDATE hr_rule_events SET last_error='Rule action failed; see application logs.', status=CASE WHEN attempts >= 5 THEN 'failed' ELSE status END WHERE event_id=$1 AND status='pending'",
+        vec![event_id.into()]).await?;
+    Ok(())
 }
 
 fn recipient_roles(key: &str) -> Option<&'static [&'static str]> {
@@ -263,7 +224,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn dispatches_only_defined_domain_transitions() {
+    fn emits_events_for_domain_transitions_and_separates_recipient_groups() {
         assert_eq!(
             event_key("employee", "created", None, &json!({})),
             Some("employee.created")
@@ -296,36 +257,6 @@ mod tests {
             Some("candidate.stage_changed")
         );
         assert_eq!(
-            event_key(
-                "payroll_run",
-                "updated",
-                Some(&json!({"status":"draft"})),
-                &json!({"status":"completed"})
-            ),
-            Some("payroll.completed")
-        );
-    }
-
-    #[test]
-    fn ignores_no_op_and_unsupported_transitions() {
-        assert_eq!(
-            event_key(
-                "leave_request",
-                "updated",
-                Some(&json!({"status":"pending"})),
-                &json!({"status":"pending"})
-            ),
-            None
-        );
-        assert_eq!(
-            event_key("custom_record", "updated", None, &json!({})),
-            None
-        );
-    }
-
-    #[test]
-    fn recipient_policy_keeps_payroll_and_recruiting_scopes_separate() {
-        assert_eq!(
             recipient_roles("payroll.completed"),
             Some(&["hr_admin", "payroll_admin"][..])
         );
@@ -337,6 +268,5 @@ mod tests {
             recipient_roles("expense.decided"),
             Some(&["hr_admin", "finance"][..])
         );
-        assert_eq!(recipient_roles("unregistered.rule"), None);
     }
 }

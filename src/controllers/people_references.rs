@@ -1,10 +1,5 @@
-use diesel::{
-    prelude::QueryableByName,
-    sql_query,
-    sql_types::{Integer, Nullable, Text, Uuid as SqlUuid},
-};
-use diesel_async::RunQueryDsl;
 use loco_rs::prelude::*;
+use sea_orm::FromQueryResult;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -13,7 +8,7 @@ use crate::{
     audit::{self, Entry},
     authz::AuthUser,
     controllers::people::ensure_reference,
-    database::Database,
+    database::sql,
     people::policy::require_people_manage,
     request_meta::RequestMeta,
 };
@@ -40,16 +35,22 @@ pub struct LocationInput {
     pub(crate) region: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema, QueryableByName)]
+#[derive(Debug, Serialize, ToSchema, FromQueryResult)]
 pub struct ReferenceRow {
-    #[diesel(sql_type = SqlUuid)]
-    id: Uuid,
-    #[diesel(sql_type = Text)]
+    pub id: Uuid,
     code: String,
-    #[diesel(sql_type = Text)]
     label: String,
-    #[diesel(sql_type = Nullable<SqlUuid>)]
     parent_id: Option<Uuid>,
+}
+
+#[derive(FromQueryResult)]
+struct Exists {
+    exists: bool,
+}
+
+#[derive(FromQueryResult)]
+struct IdRow {
+    pub id: Uuid,
 }
 
 async fn list(auth: AuthUser, ctx: AppContext, table: &'static str) -> Result<Response> {
@@ -59,13 +60,7 @@ async fn list(auth: AuthUser, ctx: AppContext, table: &'static str) -> Result<Re
         "people_grades" => "SELECT id,code,label,NULL::uuid AS parent_id FROM people_grades WHERE archived_at IS NULL ORDER BY rank",
         _ => "SELECT id,code,label,NULL::uuid AS parent_id FROM people_locations WHERE archived_at IS NULL ORDER BY lower(label)",
     };
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    let rows = sql_query(query)
-        .load::<ReferenceRow>(&mut *conn)
-        .await
-        .map_err(Database::map_error)?;
-    format::json(rows)
+    format::json(sql::all::<ReferenceRow>(&ctx.db, query, Vec::new()).await?)
 }
 
 #[utoipa::path(get, path = "/api/people/departments", security(("bearer" = [])), responses((status = 200, body = [ReferenceRow])))]
@@ -102,14 +97,12 @@ pub async fn create_department(
     {
         return bad_request("Check the department code and name.");
     }
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    ensure_reference(&mut conn, "people_departments", input.parent_id).await?;
-    let row = sql_query("INSERT INTO people_departments(code,name,parent_id) VALUES ($1,$2,$3) RETURNING id,code,name AS label,parent_id")
-        .bind::<Text,_>(input.code.trim()).bind::<Text,_>(input.name.trim()).bind::<Nullable<SqlUuid>,_>(input.parent_id)
-        .get_result::<ReferenceRow>(&mut *conn).await.map_err(Database::map_error)?;
+    ensure_reference(&ctx.db, "people_departments", input.parent_id).await?;
+    let row = sql::one::<ReferenceRow>(&ctx.db,
+        "INSERT INTO people_departments(code,name,parent_id) VALUES ($1,$2,$3) RETURNING id,code,name AS label,parent_id",
+        vec![input.code.trim().into(), input.name.trim().into(), input.parent_id.into()]).await?;
     audit::record(
-        &db,
+        &ctx.db,
         Some(&auth.user),
         &meta,
         Entry::new("people.department.created")
@@ -136,13 +129,11 @@ pub async fn create_grade(
     {
         return bad_request("Check the grade code, label, and rank.");
     }
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    let row = sql_query("INSERT INTO people_grades(code,label,rank) VALUES ($1,$2,$3) RETURNING id,code,label,NULL::uuid AS parent_id")
-        .bind::<Text,_>(input.code.trim()).bind::<Text,_>(input.label.trim()).bind::<Integer,_>(input.rank)
-        .get_result::<ReferenceRow>(&mut *conn).await.map_err(Database::map_error)?;
+    let row = sql::one::<ReferenceRow>(&ctx.db,
+        "INSERT INTO people_grades(code,label,rank) VALUES ($1,$2,$3) RETURNING id,code,label,NULL::uuid AS parent_id",
+        vec![input.code.trim().into(), input.label.trim().into(), input.rank.into()]).await?;
     audit::record(
-        &db,
+        &ctx.db,
         Some(&auth.user),
         &meta,
         Entry::new("people.grade.created")
@@ -171,13 +162,11 @@ pub async fn create_location(
     {
         return bad_request("Check the location code, label, and ISO country code.");
     }
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    let row = sql_query("INSERT INTO people_locations(code,label,country_code,region) VALUES ($1,$2,$3,$4) RETURNING id,code,label,NULL::uuid AS parent_id")
-        .bind::<Text,_>(input.code.trim()).bind::<Text,_>(input.label.trim()).bind::<Text,_>(input.country_code.to_uppercase()).bind::<Nullable<Text>,_>(input.region)
-        .get_result::<ReferenceRow>(&mut *conn).await.map_err(Database::map_error)?;
+    let row = sql::one::<ReferenceRow>(&ctx.db,
+        "INSERT INTO people_locations(code,label,country_code,region) VALUES ($1,$2,$3,$4) RETURNING id,code,label,NULL::uuid AS parent_id",
+        vec![input.code.trim().into(), input.label.trim().into(), input.country_code.to_uppercase().into(), input.region.into()]).await?;
     audit::record(
-        &db,
+        &ctx.db,
         Some(&auth.user),
         &meta,
         Entry::new("people.location.created")
@@ -188,71 +177,42 @@ pub async fn create_location(
     format::render().status(201).json(row)
 }
 
-#[utoipa::path(post, path = "/api/people/departments/{id}/archive", params(("id" = Uuid, Path)), security(("bearer" = [])), responses((status = 204)))]
-#[debug_handler]
-pub async fn archive_department(
-    auth: AuthUser,
-    State(ctx): State<AppContext>,
-    meta: RequestMeta,
-    Path(id): Path<Uuid>,
-) -> Result<Response> {
-    archive_reference(auth, ctx, meta, "people_departments", id, true).await
+macro_rules! reference_archive_routes {
+    ($archive:ident, $restore:ident, $table:literal, $archive_path:literal, $restore_path:literal) => {
+        #[utoipa::path(post, path = $archive_path, params(("id" = Uuid, Path)), security(("bearer" = [])), responses((status = 204)))]
+        #[debug_handler]
+        pub async fn $archive(auth: AuthUser, State(ctx): State<AppContext>, meta: RequestMeta, Path(id): Path<Uuid>) -> Result<Response> {
+            archive_reference(auth, ctx, meta, $table, id, true).await
+        }
+        #[utoipa::path(post, path = $restore_path, params(("id" = Uuid, Path)), security(("bearer" = [])), responses((status = 204)))]
+        #[debug_handler]
+        pub async fn $restore(auth: AuthUser, State(ctx): State<AppContext>, meta: RequestMeta, Path(id): Path<Uuid>) -> Result<Response> {
+            archive_reference(auth, ctx, meta, $table, id, false).await
+        }
+    };
 }
 
-#[utoipa::path(post, path = "/api/people/departments/{id}/restore", params(("id" = Uuid, Path)), security(("bearer" = [])), responses((status = 204)))]
-#[debug_handler]
-pub async fn restore_department(
-    auth: AuthUser,
-    State(ctx): State<AppContext>,
-    meta: RequestMeta,
-    Path(id): Path<Uuid>,
-) -> Result<Response> {
-    archive_reference(auth, ctx, meta, "people_departments", id, false).await
-}
-
-#[utoipa::path(post, path = "/api/people/grades/{id}/archive", params(("id" = Uuid, Path)), security(("bearer" = [])), responses((status = 204)))]
-#[debug_handler]
-pub async fn archive_grade(
-    auth: AuthUser,
-    State(ctx): State<AppContext>,
-    meta: RequestMeta,
-    Path(id): Path<Uuid>,
-) -> Result<Response> {
-    archive_reference(auth, ctx, meta, "people_grades", id, true).await
-}
-
-#[utoipa::path(post, path = "/api/people/grades/{id}/restore", params(("id" = Uuid, Path)), security(("bearer" = [])), responses((status = 204)))]
-#[debug_handler]
-pub async fn restore_grade(
-    auth: AuthUser,
-    State(ctx): State<AppContext>,
-    meta: RequestMeta,
-    Path(id): Path<Uuid>,
-) -> Result<Response> {
-    archive_reference(auth, ctx, meta, "people_grades", id, false).await
-}
-
-#[utoipa::path(post, path = "/api/people/locations/{id}/archive", params(("id" = Uuid, Path)), security(("bearer" = [])), responses((status = 204)))]
-#[debug_handler]
-pub async fn archive_location(
-    auth: AuthUser,
-    State(ctx): State<AppContext>,
-    meta: RequestMeta,
-    Path(id): Path<Uuid>,
-) -> Result<Response> {
-    archive_reference(auth, ctx, meta, "people_locations", id, true).await
-}
-
-#[utoipa::path(post, path = "/api/people/locations/{id}/restore", params(("id" = Uuid, Path)), security(("bearer" = [])), responses((status = 204)))]
-#[debug_handler]
-pub async fn restore_location(
-    auth: AuthUser,
-    State(ctx): State<AppContext>,
-    meta: RequestMeta,
-    Path(id): Path<Uuid>,
-) -> Result<Response> {
-    archive_reference(auth, ctx, meta, "people_locations", id, false).await
-}
+reference_archive_routes!(
+    archive_department,
+    restore_department,
+    "people_departments",
+    "/api/people/departments/{id}/archive",
+    "/api/people/departments/{id}/restore"
+);
+reference_archive_routes!(
+    archive_grade,
+    restore_grade,
+    "people_grades",
+    "/api/people/grades/{id}/archive",
+    "/api/people/grades/{id}/restore"
+);
+reference_archive_routes!(
+    archive_location,
+    restore_location,
+    "people_locations",
+    "/api/people/locations/{id}/archive",
+    "/api/people/locations/{id}/restore"
+);
 
 async fn archive_reference(
     auth: AuthUser,
@@ -263,19 +223,18 @@ async fn archive_reference(
     archive: bool,
 ) -> Result<Response> {
     require_people_manage(&auth)?;
-    let db = Database::from_context(&ctx)?;
-    let mut conn = db.get().await?;
-    if archive {
-        let query=match table { "people_departments" => "SELECT EXISTS(SELECT 1 FROM people_employees WHERE department_id=$1 AND archived_at IS NULL) OR EXISTS(SELECT 1 FROM people_departments WHERE parent_id=$1 AND archived_at IS NULL) AS exists", "people_grades" => "SELECT EXISTS(SELECT 1 FROM people_employees WHERE grade_id=$1 AND archived_at IS NULL) AS exists", _ => "SELECT EXISTS(SELECT 1 FROM people_employees WHERE location_id=$1 AND archived_at IS NULL) AS exists" };
-        if sql_query(query)
-            .bind::<SqlUuid, _>(id)
-            .get_result::<Exists>(&mut *conn)
-            .await
-            .map_err(Database::map_error)?
+    let (dependency_query, label) = match table {
+        "people_departments" => ("SELECT EXISTS(SELECT 1 FROM people_employees WHERE department_id=$1 AND archived_at IS NULL) OR EXISTS(SELECT 1 FROM people_departments WHERE parent_id=$1 AND archived_at IS NULL) AS exists", "department"),
+        "people_grades" => ("SELECT EXISTS(SELECT 1 FROM people_employees WHERE grade_id=$1 AND archived_at IS NULL) AS exists", "grade"),
+        "people_locations" => ("SELECT EXISTS(SELECT 1 FROM people_employees WHERE location_id=$1 AND archived_at IS NULL) AS exists", "location"),
+        _ => return bad_request("Invalid reference type."),
+    };
+    if archive
+        && sql::one::<Exists>(&ctx.db, dependency_query, vec![id.into()])
+            .await?
             .exists
-        {
-            return bad_request("Archive the dependent employee or child records first.");
-        }
+    {
+        return bad_request("Archive the dependent employee or child records first.");
     }
     let value = if archive { "now()" } else { "NULL" };
     let parent_guard = if !archive && table == "people_departments" {
@@ -283,15 +242,12 @@ async fn archive_reference(
     } else {
         ""
     };
-    let sql = format!("UPDATE {table} SET archived_at={value},updated_at=now() WHERE id=$1{parent_guard} RETURNING id");
-    let changed = sql_query(&sql)
-        .bind::<SqlUuid, _>(id)
-        .get_result::<Id>(&mut *conn)
-        .await
-        .map_err(Database::map_error)?;
-    let _ = changed.id;
+    let query = format!("UPDATE {table} SET archived_at={value},updated_at=now() WHERE id=$1{parent_guard} RETURNING id");
+    let archived_id = sql::one::<IdRow>(&ctx.db, &query, vec![id.into()])
+        .await?
+        .id;
     audit::record(
-        &db,
+        &ctx.db,
         Some(&auth.user),
         &meta,
         Entry::new(if archive {
@@ -299,22 +255,11 @@ async fn archive_reference(
         } else {
             "people.reference.restored"
         })
-        .target(table, id)
+        .target(label, archived_id)
         .summary("changed_fields=archived_at"),
     )
     .await?;
     format::render().status(204).json(())
-}
-
-#[derive(QueryableByName)]
-struct Exists {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    exists: bool,
-}
-#[derive(QueryableByName)]
-struct Id {
-    #[diesel(sql_type = SqlUuid)]
-    id: Uuid,
 }
 
 pub fn routes() -> Routes {
